@@ -133,7 +133,7 @@ interface SessionWriteInput {
   peer?: boolean;
   text?: string;
   interrupt?: boolean;
-  followup?: boolean;
+  wake?: boolean;
   requestId?: string;
 }
 
@@ -142,7 +142,9 @@ type SessionWriteResult =
       ok: true;
       sessionId: string;
       title: string;
-      delivered: "steered" | "queued_turn" | "interrupted" | "queued_message";
+      delivered: "queued_turn" | "interrupted" | "queued_message";
+      busy?: boolean;
+      notWoken?: string;
     }
   | { ok: false; message: string };
 
@@ -800,16 +802,11 @@ export function createSessionSyscalls(deps: SessionSyscallDeps): SessionSyscalls
                   : { ok: false, message: `subagent "${title}" is not running — nothing to interrupt.` };
               }
               const text = input.text?.trim();
-              if (!text)
-                return {
-                  ok: false,
-                  message: input.followup
-                    ? "followup_task requires `task`: the full instruction the subagent works from."
-                    : "send_message requires `text` (or interrupt: true).",
-                };
+              if (!text) return { ok: false, message: "send_message requires `text` (or interrupt: true)." };
               if (text.length > 16_000) return { ok: false, message: "message exceeds 16000 characters" };
               const stamped = renderSubagentMessage({ title: callerTitle, sessionId: binding.session.id }, text);
-              if (!input.followup) {
+              const busy = (await deps.runs.inFlightForThread(target.threadRef)).length > 0;
+              const leaveMail = async (notWoken?: string): Promise<SessionWriteResult> => {
                 const sourceEntrySeq = await deps.sessions.latestEntrySeq(binding.session.id);
                 await deps.mailbox.send({
                   id: input.requestId
@@ -823,15 +820,22 @@ export function createSessionSyscalls(deps: SessionSyscallDeps): SessionSyscalls
                   audience: caller.conversation.audience,
                   createdAt: Date.now(),
                 });
-                return { ok: true, sessionId: target.id, title, delivered: "queued_message" };
-              }
-              if (input.followup && binding.request.privateSessionMessage)
-                return { ok: false, message: "private turns cannot assign follow-up work" };
-              if (input.followup && !target.parentSessionId)
                 return {
-                  ok: false,
-                  message: "follow-up tasks can only target an attached subagent; use a message for the root",
+                  ok: true,
+                  sessionId: target.id,
+                  title,
+                  delivered: "queued_message",
+                  busy,
+                  ...(notWoken ? { notWoken } : {}),
                 };
+              };
+              if (!input.wake) return leaveMail();
+              if (binding.request.privateSessionMessage)
+                return leaveMail("a private turn cannot start work in another session");
+              if (!target.parentSessionId)
+                return leaveMail(
+                  "a message cannot start a turn in a top-level conversation; if it is your parent, your final answer reaches it when you finish",
+                );
 
               const dedupKey = input.requestId
                 ? `subagent-followup:${hashId([binding.session.id, binding.request.runId ?? "", input.requestId], 40)}`
@@ -844,17 +848,23 @@ export function createSessionSyscalls(deps: SessionSyscallDeps): SessionSyscalls
                     (existing.request.text !== stamped && existing.request.text !== pgTextSafe(stamped))
                   )
                     return { ok: false, message: "the requestId was already used for different work" };
-                  return { ok: true, sessionId: target.id, title, delivered: "queued_turn" };
+                  const others = (await deps.runs.inFlightForThread(target.threadRef)).filter(
+                    (run) => run.id !== existing.id,
+                  );
+                  return { ok: true, sessionId: target.id, title, delivered: "queued_turn", busy: others.length > 0 };
                 }
               }
-              request.origin = sessionTurnOrigin(request.origin, stamped);
-              request.sessionSenderId = binding.session.id;
-              request.delegatingRunId = binding.request.runId;
               if (
                 (await sessionTreeRunCount(deps.sessions, deps.runs, await sessionTreeRoot(deps.sessions, target))) >=
                 cap
               )
-                return { ok: false, message: `all ${cap} session run slots are in use.` };
+                return {
+                  ok: false,
+                  message: `all ${cap} session run slots are in use; nothing was sent. Retry later, or send with wake:false to leave it in the mailbox.`,
+                };
+              request.origin = sessionTurnOrigin(request.origin, stamped);
+              request.sessionSenderId = binding.session.id;
+              request.delegatingRunId = binding.request.runId;
               await deps.runs.enqueue({
                 sessionId: target.threadRef,
                 dedupKey,
@@ -868,7 +878,7 @@ export function createSessionSyscalls(deps: SessionSyscallDeps): SessionSyscalls
                 },
                 maxAttempts: deps.maxAttempts,
               });
-              return { ok: true, sessionId: target.id, title, delivered: "queued_turn" };
+              return { ok: true, sessionId: target.id, title, delivered: "queued_turn", busy };
             })
             .catch((error): SessionWriteResult => ({ ok: false, message: errMessage(error) }));
         },
