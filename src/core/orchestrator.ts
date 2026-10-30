@@ -17,11 +17,17 @@ import { memoryRecallQuery } from "../memory/semantic-recall.ts";
 import { requiresDelegation, delegatedAuthorizationOrigin } from "../sessions/session-syscalls.ts";
 import {
   documentText,
+  type DocumentInput,
   type ExtractedDocumentText,
   historicalDocumentMetas,
   loadDocumentInputs,
-} from "./document-inputs.ts";
-import { MAX_DOCUMENT_BYTES, estimateDocumentTokens, isDocumentAttachment, isTextDocument } from "./document-kinds.ts";
+  MAX_DOCUMENT_BYTES,
+  MAX_DOCUMENT_TEXT_CHARS,
+  MAX_DOCUMENTS,
+  estimateDocumentTokens,
+  isDocumentAttachment,
+  isTextDocument,
+} from "./documents.ts";
 import { recoveredRuntime } from "../agent/runtime-recovery.ts";
 import { createCanWriteScope, rosterAdmits, withLiveTurnMembership } from "../resolution/scope-membership.ts";
 import { goalView } from "../runs/turn-stream.ts";
@@ -29,6 +35,8 @@ import { assignedGoal, type GoalRecord, openGoal } from "../agent/goal.ts";
 import { connectorToolsNote, deferredMcpTools } from "../agent/deferred-tools.ts";
 import { createSwarmGoalInbox, openSwarmMailbox } from "../swarms/swarm-goal-inbox.ts";
 import type {
+  AttachmentMeta,
+  IncomingAttachment,
   CommandApprovalGrant,
   DeliveryProvenance,
   Destination,
@@ -45,7 +53,6 @@ import { scopeId as toScopeId, personalScope } from "../types.ts";
 import { desktopClientForTurn, isSessionTurn, turnOriginRequestFields } from "./turn-origin.ts";
 import { resolveTurnFastMode, turnRuntimePurpose } from "./turn-options.ts";
 import { orgId } from "../config.ts";
-import { renderGatewayContext } from "./gateway-context.ts";
 import { deriveTurnOutcome, approvalBlocksInput } from "./turn-outcome.ts";
 import { applyPromptVars, loadProtocolFile, type PromptVars } from "../resolution/prompt-vars.ts";
 import { cleanBrandingLabel, resolveBranding } from "../resolution/branding.ts";
@@ -77,7 +84,6 @@ import {
 } from "../credentials/keychain.ts";
 import { finishProcessCredentials } from "../credentials/execute-files.ts";
 import { configuredConnectorProviders } from "../credentials/connector-status.ts";
-import { membershipEvent, renderSandboxProviders } from "./environment-facts.ts";
 import { CONNECTOR_HOSTS } from "../connectors/oauth.ts";
 import { SANDBOX_MODEL_PREFIX } from "../api/contract.ts";
 import { estimateCostUsd } from "../ratelimit/budget.ts";
@@ -109,11 +115,11 @@ import {
   toolLabelOf,
   UNSCREENED_REASON,
   unscreenedNotice,
-  type SecurityScreenVerdict,
   type ToolResultScreen,
   type ToolResultScreenInput,
 } from "../security/security-posture.ts";
 import { commandApprovalId, inputApprovalId } from "./approval-id.ts";
+import { approvalView, grantModesWithin } from "./orchestrator/approvals.ts";
 import { createPerTurnStrategy } from "../memory/strategies/per-turn.ts";
 import { DEFAULT_MEMORY_POLICY } from "../memory/policy.ts";
 import { collectBlob } from "../persistence/blob-transfer.ts";
@@ -129,15 +135,12 @@ import { defaultPublishAudience } from "../resolution/publish-audience.ts";
 import {
   INBOX_DIR,
   TURN_FILES_DIR,
-  environmentNote,
   inboundIssuesNote,
   inboundIssueList,
   inboundManifest,
   isVisionAttachment,
   materializeInbound,
   safeAttachmentName,
-  senderNote,
-  sharedFilesSystemSection,
   turnFileId,
   type ArtifactRegistration,
   withoutAlreadyIngested,
@@ -199,7 +202,13 @@ import {
 import {
   currentTimeBlock,
   deliveryMenu,
+  environmentNote,
+  membershipEvent,
   renderConversationRoster,
+  renderGatewayContext,
+  renderSandboxProviders,
+  senderNote,
+  sharedFilesSystemSection,
   renderProjectHomeChannel,
   renderReachRoster,
   renderStandingObligations,
@@ -208,13 +217,19 @@ import {
 } from "./orchestrator/prompt-blocks.ts";
 import { createCompaction } from "./orchestrator/compaction.ts";
 import { startLeaseKeepalive } from "./orchestrator/lease-keepalive.ts";
-import { createSecurityClassifier } from "./orchestrator/security-screen.ts";
+import {
+  cleanVerdict,
+  createSecurityClassifier,
+  screenChunks,
+  type SecurityScreenContext,
+  unscreenedVerdict,
+} from "./orchestrator/security-screen.ts";
 import { createTurnSandboxes } from "./orchestrator/sandboxes.ts";
 import type { EgressPolicy } from "../types.ts";
 import { isOpenScopeMember } from "../resolution/sharing-access.ts";
-import { createSurfaceToolDeps, type SpineState } from "./orchestrator/surface-tools.ts";
+import { createSurfaceToolDeps, type SpineState } from "../surfaces/surface-tools.ts";
 import { createAttachStaging } from "./orchestrator/attach-tool.ts";
-import { reconcileMessageRevisions, revisionAnchorAt } from "./message-revisions.ts";
+import { reconcileMessageRevisions, revisionAnchorAt } from "../slack/message-revisions.ts";
 import { type ProviderKeys } from "../model/model-runtime.ts";
 
 export { egressClaimAllowingControlPlane, filterConnectorSkills } from "./orchestrator/turn-helpers.ts";
@@ -673,9 +688,12 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
           if (step) deps.turnStream?.settleReasoning(input.runId, step.id, step.index);
         }
       };
-      if (!(await managedRosterIsCurrent())) {
-        return { status: "refused", reason: "project membership changed; retry from the current project" };
-      }
+      const rosterChanged = (sessionId?: string): TurnResult => ({
+        status: "refused",
+        ...(sessionId ? { sessionId } : {}),
+        reason: "project membership changed; retry from the current project",
+      });
+      if (!(await managedRosterIsCurrent())) return rosterChanged();
       if (conversation.kind !== "dm" && !deps.identity.audienceIsAllInternal(conversation.audience)) {
         const externalAllowed =
           external ||
@@ -712,6 +730,22 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
       const scopeId = deps.resolution.scopeFor(conversation, actor);
       const audit = (event: Omit<AuditEvent, "at" | "principalId" | "scopeLabel">) =>
         deps.auditLog.record({ at: Date.now(), principalId: actor.id, scopeLabel: scopeId, ...event });
+      const issueApproval = async (
+        requestId: string,
+        fields: Omit<PendingApprovalRecord, "createdAt" | "request">,
+      ): Promise<PendingApproval> => {
+        const { grantModes, ...rest } = fields;
+        const record: PendingApprovalRecord = {
+          ...(Object.fromEntries(
+            Object.entries(rest).filter(([, value]) => value !== undefined && value !== ""),
+          ) as typeof rest),
+          createdAt: Date.now(),
+          request: replayableRequest(input),
+          ...grantModesWithin(resolution.approvalGrantModes, grantModes),
+        };
+        await pending.put(requestId, record);
+        return approvalView(requestId, record);
+      };
       const isCurrentSharedScopeMember = withLiveTurnMembership(deps.isCurrentSharedScopeMember, {
         actorId: actor.id,
         scopeId,
@@ -781,6 +815,17 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
           reportFailure("orchestrator: persist security screen request snapshot", err);
         }
       };
+      const classifyAs =
+        (
+          context: Omit<SecurityScreenContext, "mode" | "thread" | "runId" | "origin">,
+          record?: typeof recordScreenRequest,
+        ) =>
+        (chunk: string) =>
+          classifySecurityData(chunk, actor.id, scopeId, record, {
+            ...screenTrace,
+            origin: input.origin.kind,
+            ...context,
+          });
       const buildInboundScreen = async () => {
         let overheard: OverheardEntryPayload[] = [];
         if (screenInbound) {
@@ -865,12 +910,7 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
         void buildInboundScreen()
           .then(({ screenPayload }) =>
             screenPayload && !screenPayload.truncated
-              ? classifySecurityData(screenPayload.content, actor.id, scopeId, undefined, {
-                  ...screenTrace,
-                  hook: "user_input",
-                  surface: input.surface,
-                  origin: input.origin.kind,
-                })
+              ? classifyAs({ hook: "user_input", surface: input.surface })(screenPayload.content)
               : undefined,
           )
           .catch(swallowAs("orchestrator: observed inbound screen", undefined));
@@ -880,12 +920,10 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
           const canScreenText =
             !!screenPayload && !screenPayload.truncated && (!!deps.securityScreener || !!deps.agent.screenSecurity);
           const verdict = canScreenText
-            ? await classifySecurityData(screenPayload!.content, actor.id, scopeId, recordScreenRequest, {
-                ...screenTrace,
-                hook: "user_input",
-                surface: input.surface,
-                origin: input.origin.kind,
-              })
+            ? await screenChunks(
+                [screenPayload!.content],
+                classifyAs({ hook: "user_input", surface: input.surface }, recordScreenRequest),
+              )
             : undefined;
           let unscreenableCause: "unscreenable-attachment" | "oversize-input" | "no-screener" | undefined;
           if (hasUnscreenableAttachment || !screenPayload) unscreenableCause = "unscreenable-attachment";
@@ -956,59 +994,27 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
         });
         if (!acquired.lease) return acquired.refusal;
         const lease = acquired.lease;
+        let approval: PendingApproval;
         try {
-          await withManagedRosterVersion(async () => {
+          approval = await withManagedRosterVersion(async () => {
             await reconcileSessionParticipants(session.id);
             await Promise.all(pendingScreenRequests.splice(0).map((rec) => recordScreenRequest(rec)));
-            const command = "security-screen";
-            const requestId = inputApprovalId(session.id, replayableRequest(input));
-            const grantModesField =
-              resolution.approvalGrantModes.session && resolution.approvalGrantModes.always
-                ? {}
-                : { grantModes: resolution.approvalGrantModes };
-            const reason = `${flaggedScreenedInput.reason}; flagged sources: ${flaggedScreenedInput.sources.join(", ") || "message"}`;
-            await pending.put(requestId, {
+            return issueApproval(inputApprovalId(session.id, replayableRequest(input)), {
               sessionId: session.id,
-              command,
-              createdAt: Date.now(),
-              reason,
-              request: replayableRequest(input),
-              blocksInput: true,
-              kind: "input",
-              approvalKey: `security-screen:${input.surface ?? "unknown"}`,
-              ...grantModesField,
-            });
-            return true;
-          });
-        } catch (err) {
-          if (err instanceof ProjectRosterChanged) {
-            return {
-              status: "refused",
-              sessionId: session.id,
-              reason: "project membership changed; retry from the current project",
-            };
-          }
-          throw err;
-        } finally {
-          await deps.sessions.releaseLease(lease);
-        }
-        return {
-          status: "pending_approval",
-          sessionId: session.id,
-          pendingApprovals: [
-            {
-              requestId: inputApprovalId(session.id, replayableRequest(input)),
               command: "security-screen",
               reason: `${flaggedScreenedInput.reason}; flagged sources: ${flaggedScreenedInput.sources.join(", ") || "message"}`,
               blocksInput: true,
               kind: "input",
               approvalKey: `security-screen:${input.surface ?? "unknown"}`,
-              ...(resolution.approvalGrantModes.session && resolution.approvalGrantModes.always
-                ? {}
-                : { grantModes: resolution.approvalGrantModes }),
-            },
-          ],
-        };
+            });
+          });
+        } catch (err) {
+          if (err instanceof ProjectRosterChanged) return rosterChanged(session.id);
+          throw err;
+        } finally {
+          await deps.sessions.releaseLease(lease);
+        }
+        return { status: "pending_approval", sessionId: session.id, pendingApprovals: [approval] };
       }
       const childFloor = delegatedSession?.spawnMeta?.readOnly === true;
       const strictReadOnly = input.readOnly === true || input.privateSessionMessage === true || childFloor;
@@ -1181,17 +1187,15 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
               screen = (async () => {
                 if (bundles === null || Buffer.byteLength(payload, "utf8") > MAX_AUTO_ATTACHMENT_SCREEN_BYTES)
                   return false;
-                for (const chunk of securityScreenChunks("tool_result:shared_skill", payload)) {
-                  const verdict = await classifySecurityData(chunk, actor.id, scopeId, recordScreenRequest, {
-                    ...screenTrace,
-                    hook: "tool_response",
-                    request: input.text,
-                    surface: "shared_skill",
-                    origin: input.origin.kind,
-                  });
-                  if (verdict?.decision !== "auto" || verdict.unscreened) return false;
-                }
-                return true;
+                const verdict = await screenChunks(
+                  securityScreenChunks("tool_result:shared_skill", payload),
+                  classifyAs(
+                    { hook: "tool_response", request: input.text, surface: "shared_skill" },
+                    recordScreenRequest,
+                  ),
+                  { stopUnclean: true },
+                );
+                return cleanVerdict(verdict);
               })();
               carriedSkillScreens.set(key, screen);
             }
@@ -2092,19 +2096,11 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
                 sessionId: session.id,
                 reason,
                 pendingApprovals: [
-                  {
-                    requestId: input.approval.requestId,
-                    command: p.command,
-                    reason: p.reason ?? "requires approval",
-                    blocksInput: p.blocksInput !== false,
-                    grantModes: p.grantModes ?? resolution.approvalGrantModes,
-                    ...(p.matched ? { matched: p.matched } : {}),
-                    ...(p.purpose ? { purpose: p.purpose } : {}),
-                    ...(p.summary ? { summary: p.summary } : {}),
-                    ...(p.summaryDetail ? { summaryDetail: p.summaryDetail } : {}),
-                    ...(p.approvalKey ? { approvalKey: p.approvalKey } : {}),
-                    ...(p.kind ? { kind: p.kind } : {}),
-                  },
+                  approvalView(input.approval.requestId, {
+                    ...p,
+                    grantModes: undefined,
+                    ...grantModesWithin(resolution.approvalGrantModes, p.grantModes),
+                  }),
                 ],
               };
             }
@@ -2733,28 +2729,39 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
         if (input.attachments?.some((attachment) => attachment.sourceId)) {
           input.attachments = withoutAlreadyIngested(input.attachments, (await turnWindow()).entries);
         }
-        const inbound =
-          input.attachments?.length && !strictReadOnly
-            ? await materializeInbound(
+        const receiveInbound = async (
+          attachments: IncomingAttachment[] | undefined,
+          registration: ArtifactRegistration,
+          inboxDir: string,
+          requestText: string,
+        ): ReturnType<typeof materializeInbound> =>
+          attachments?.length && !strictReadOnly
+            ? materializeInbound(
                 deps.sandbox,
                 provision,
-                input.attachments,
+                attachments,
                 blobTransfer,
-                fileRegistration,
-                turnInboxDir,
-                securityPolicy.screening !== "off" && (deps.securityScreener || deps.agent.screenSecurity)
-                  ? ({ content }) =>
-                      classifySecurityData(content, actor.id, scopeId, undefined, {
-                        ...screenTrace,
-                        sessionId: session.id,
-                        hook: "tool_response",
-                        request: input.text,
-                        surface: "inbound_file",
-                        origin: input.origin.kind,
-                      })
+                registration,
+                inboxDir,
+                securityPolicy.screening !== "off"
+                  ? async ({ content, name, mimetype }) => {
+                      const payload = JSON.stringify({ name, mimetype, content });
+                      if (payload.length > MAX_DOCUMENT_TEXT_CHARS) return unscreenedVerdict();
+                      return screenChunks(
+                        securityScreenChunks("tool_result:inbound_file", payload),
+                        classifyAs({
+                          sessionId: session.id,
+                          hook: "tool_response",
+                          request: requestText,
+                          surface: "inbound_file",
+                        }),
+                        { batch: 4, signal: turnAbort.signal },
+                      );
+                    }
                   : undefined,
               )
             : { metas: [], images: [], tooMany: [], unavailable: [], blocked: [], unscreened: [] };
+        const inbound = await receiveInbound(input.attachments, fileRegistration, turnInboxDir, input.text);
         const manifest = inboundManifest(inbound.metas, turnInboxDir, inbound.unstaged, actor.displayName);
         const inboundIssues = inboundIssueList({
           tooMany: inbound.tooMany,
@@ -2830,18 +2837,6 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
         contextRecovered =
           history !== visibleHistory &&
           history.some((entry) => isObj(entry.payload) && entry.payload.mode === "recent");
-        const documentInputs = strictReadOnly
-          ? { documents: [], notices: [], tokens: 0 }
-          : await loadDocumentInputs(
-              deps.files,
-              [...historicalDocumentMetas(history), ...inbound.metas],
-              mayReadArtifact,
-              undefined,
-              turnAbort.signal,
-              undefined,
-              undefined,
-              Math.max(0, documentBudget - countTokens(sideDiscussions)),
-            );
         const screenDocuments = async (
           documentInputs: Awaited<ReturnType<typeof loadDocumentInputs>>,
           requestText: string,
@@ -2862,50 +2857,58 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
                 documentsUnscreened = true;
                 continue;
               }
-              const verdicts: Array<SecurityScreenVerdict | undefined> = [];
-              for (const chunk of securityScreenChunks("tool_result:inbound_document", extracted.text)) {
-                turnAbort.signal.throwIfAborted();
-                const verdict = await classifySecurityData(chunk, actor.id, scopeId, undefined, {
-                  ...screenTrace,
+              const verdict = await screenChunks(
+                securityScreenChunks("tool_result:inbound_document", extracted.text),
+                classifyAs({
                   sessionId: session.id,
                   hook: "tool_response",
                   request: requestText,
                   surface: "inbound_file",
-                  origin: input.origin.kind,
-                });
-                verdicts.push(verdict);
-                if (verdict?.decision === "strict") break;
-              }
-              const verdict =
-                verdicts.find((value) => value?.decision === "strict") ??
-                verdicts.find((value) => value?.unscreened) ??
-                verdicts[0];
-              if (verdict?.decision === "strict") {
+                }),
+                { signal: turnAbort.signal },
+              );
+              if (verdict.decision === "strict") {
                 documentInputs.documents.splice(documentInputs.documents.indexOf(document), 1);
                 documentInputs.notices.push(
                   `${document.name}: document withheld by the external-data security screen.`,
                 );
-              } else if (
-                !verdicts.every((value) => value?.decision === "auto" && !value.unscreened) ||
-                extracted.truncated
-              )
-                documentsUnscreened = true;
+              } else if (verdict.unscreened || extracted.truncated) documentsUnscreened = true;
             }
           }
           return enforceScreen && documentsUnscreened;
         };
-        const observeDocuments = (inputs: Awaited<ReturnType<typeof loadDocumentInputs>>, requestText: string) =>
-          void screenDocuments(inputs, requestText).catch(swallowAs("orchestrator: observed document screen", false));
-        let documentsUnscreened = false;
-        if (enforceScreen) documentsUnscreened = await screenDocuments(documentInputs, input.text);
-        else observeDocuments(documentInputs, input.text);
-        let remainingDocumentBytes =
-          MAX_DOCUMENT_BYTES -
-          documentInputs.documents.reduce((sum, document) => sum + Buffer.byteLength(document.dataBase64, "base64"), 0);
-        let remainingDocumentCount = 10 - documentInputs.documents.length;
-        let remainingDocumentTokens = Math.max(
-          0,
-          documentBudget - countTokens(sideDiscussions) - documentInputs.tokens,
+        const documentRoom = {
+          maxBytes: MAX_DOCUMENT_BYTES,
+          maxDocuments: MAX_DOCUMENTS,
+          maxTokens: Math.max(0, documentBudget - countTokens(sideDiscussions)),
+        };
+        const ingestDocuments = async (
+          metas: readonly AttachmentMeta[],
+          requestText: string,
+          existingDocuments: readonly DocumentInput[] = [],
+        ) => {
+          const loaded = strictReadOnly
+            ? { documents: [], notices: [], tokens: 0 }
+            : await loadDocumentInputs(deps.files, metas, mayReadArtifact, {
+                ...documentRoom,
+                signal: turnAbort.signal,
+                existingDocuments,
+              });
+          let unscreened = false;
+          if (enforceScreen) unscreened = await screenDocuments(loaded, requestText);
+          else
+            void screenDocuments(loaded, requestText).catch(swallowAs("orchestrator: observed document screen", false));
+          documentRoom.maxBytes -= loaded.documents.reduce(
+            (sum, document) => sum + Buffer.byteLength(document.dataBase64, "base64"),
+            0,
+          );
+          documentRoom.maxDocuments -= loaded.documents.length;
+          documentRoom.maxTokens -= loaded.tokens;
+          return { ...loaded, unscreened };
+        };
+        const documentInputs = await ingestDocuments(
+          [...historicalDocumentMetas(history), ...inbound.metas],
+          input.text,
         );
         const lastUserAt = visibleHistory.findLast((e) => e.type === "user" && !isOverheardEntry(e))?.createdAt;
         const principalDelivered = await recentPrincipalDeliveryNote(deps.deliveries, session.threadRef, lastUserAt);
@@ -2914,7 +2917,7 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
             ? senderNote(actor.displayName ?? nameOf(actor.id) ?? actor.id)
             : "";
         const unscreenedNote =
-          inputUnscreened || (enforceScreen && inbound.unscreened.length) || documentsUnscreened
+          inputUnscreened || (enforceScreen && inbound.unscreened.length) || documentInputs.unscreened
             ? unscreenedNotice("inbound content")
             : "";
         const screenSwarmMessage = async (text: string): Promise<string | null> => {
@@ -3288,71 +3291,23 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
               if (refreshedInbox) {
                 let allowed = true;
                 if (securityPolicy.screening !== "off") {
-                  for (const chunk of securityScreenChunks("conversation-header", refreshedInbox)) {
-                    const verdict = await classifySecurityData(chunk, actor.id, scopeId, recordScreenRequest, {
-                      ...screenTrace,
-                      sessionId: session.id,
-                      hook: "user_input",
-                      request: text,
-                      surface: "steer",
-                      origin: input.origin.kind,
-                    });
-                    if (verdict?.decision !== "auto" || verdict.unscreened) {
-                      allowed = false;
-                      break;
-                    }
-                  }
+                  const verdict = await screenChunks(
+                    securityScreenChunks("conversation-header", refreshedInbox),
+                    classifyAs(
+                      { sessionId: session.id, hook: "user_input", request: text, surface: "steer" },
+                      recordScreenRequest,
+                    ),
+                    { stopUnclean: true },
+                  );
+                  allowed = cleanVerdict(verdict);
                 }
                 text = `${text}\n\n${allowed ? refreshedInbox : "Updated inbox context was withheld by the security screen."}`;
               }
               if (!request?.attachments?.length) return { text, author };
               const seed = `${fileRegistration.seed}:steer:${randomUUID()}`;
               const inboxDir = `${turnInboxDir}/${randomUUID()}`;
-              const received = strictReadOnly
-                ? { metas: [], images: [], tooMany: [], unavailable: [], blocked: [], unscreened: [] }
-                : await materializeInbound(
-                    deps.sandbox,
-                    provision,
-                    request.attachments,
-                    blobTransfer,
-                    { ...fileRegistration, seed },
-                    inboxDir,
-                    securityPolicy.screening !== "off"
-                      ? ({ content, name, mimetype }) =>
-                          classifySecurityData(
-                            JSON.stringify({ name, mimetype, content }),
-                            actor.id,
-                            scopeId,
-                            undefined,
-                            {
-                              ...screenTrace,
-                              sessionId: session.id,
-                              hook: "tool_response",
-                              surface: "inbound_file",
-                              origin: input.origin.kind,
-                            },
-                          )
-                      : undefined,
-                  );
-              const steeredDocuments = await loadDocumentInputs(
-                deps.files,
-                received.metas,
-                mayReadArtifact,
-                remainingDocumentBytes,
-                turnAbort.signal,
-                remainingDocumentCount,
-                initialDocuments,
-                remainingDocumentTokens,
-              );
-              let steeredUnscreened = false;
-              if (enforceScreen) steeredUnscreened = await screenDocuments(steeredDocuments, text);
-              else observeDocuments(steeredDocuments, text);
-              remainingDocumentBytes -= steeredDocuments.documents.reduce(
-                (sum, document) => sum + Buffer.byteLength(document.dataBase64, "base64"),
-                0,
-              );
-              remainingDocumentCount -= steeredDocuments.documents.length;
-              remainingDocumentTokens -= steeredDocuments.tokens;
+              const received = await receiveInbound(request.attachments, { ...fileRegistration, seed }, inboxDir, text);
+              const steeredDocuments = await ingestDocuments(received.metas, text, initialDocuments);
               documentInputs.documents.push(...steeredDocuments.documents);
               const issues = inboundIssueList({
                 ...received,
@@ -3367,7 +3322,7 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
                   ...steeredDocuments.notices,
                   inboundIssuesNote(issues),
                   enforceScreen &&
-                  (steeredUnscreened ||
+                  (steeredDocuments.unscreened ||
                     received.unscreened.length ||
                     received.metas.some((a) => !isScreenableTextAttachment(a.mimetype)))
                     ? unscreenedNotice("inbound content")
@@ -3453,15 +3408,10 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
                     if (provenance !== "external") return { outcome: "allow" };
                     const toolLabel = toolLabelOf(tool);
                     const sourceLabel = source ? `:${source.replace(/[^A-Za-z0-9_-]/g, "_")}` : "";
-                    const screenChunk = (chunk: string) =>
-                      classifySecurityData(chunk, actor.id, scopeId, recordScreenRequest, {
-                        ...screenTrace,
-                        sessionId: session.id,
-                        hook: "tool_response",
-                        request: input.text,
-                        surface: toolLabel,
-                        origin: input.origin.kind,
-                      });
+                    const screenChunk = classifyAs(
+                      { sessionId: session.id, hook: "tool_response", request: input.text, surface: toolLabel },
+                      recordScreenRequest,
+                    );
                     if (!enforceScreen) {
                       if (!unscreenable)
                         await Promise.all(
@@ -3478,21 +3428,14 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
                       });
                       return { outcome: "unscreened" };
                     }
-                    const chunks = unscreenable
-                      ? []
-                      : securityScreenChunks(`tool_result:${toolLabel}${sourceLabel}`, result);
-                    if (!unscreenable && chunks.length === 0) return { outcome: "allow" };
-                    const verdicts: Array<SecurityScreenVerdict | undefined> = [];
-                    for (let i = 0; i < chunks.length && !verdicts.some((v) => v?.decision === "strict"); i += 4) {
-                      verdicts.push(...(await Promise.all(chunks.slice(i, i + 4).map(screenChunk))));
-                    }
-                    const verdict =
-                      verdicts.find((v) => v?.decision === "strict") ??
-                      (verdicts.length === chunks.length &&
-                      verdicts.every((v) => v?.decision === "auto" && !v.unscreened)
-                        ? verdicts[0]
-                        : undefined);
-                    if (verdict?.decision === "auto" && !verdict.unscreened) return { outcome: "allow" };
+                    const verdict = unscreenable
+                      ? undefined
+                      : await screenChunks(
+                          securityScreenChunks(`tool_result:${toolLabel}${sourceLabel}`, result),
+                          screenChunk,
+                          { batch: 4 },
+                        );
+                    if (cleanVerdict(verdict)) return { outcome: "allow" };
                     if (verdict?.decision === "strict") {
                       const releaseKey = `security-screen-release:${toolLabel}`;
                       if (authorizeCommand(releaseKey)) {
@@ -3816,13 +3759,7 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
         } else if (isPollFire && result.silent && !stagedAttachments.length && result.pausedOnApproval !== true) {
           finalResult = { status: "silent", sessionId: session.id };
         } else if (result.pendingApprovals?.length || quarantineReleaseApprovals.length) {
-          const approvals: PendingApproval[] = [];
-          const grantModesField =
-            resolution.approvalGrantModes.session && resolution.approvalGrantModes.always
-              ? {}
-              : { grantModes: resolution.approvalGrantModes };
-          const request = replayableRequest(input);
-          const prepared: Array<{ requestId: string; record: PendingApprovalRecord; approval: PendingApproval }> = [];
+          const issued: Array<[string, Omit<PendingApprovalRecord, "createdAt" | "request">]> = [];
           const turnApprovals: Array<
             NonNullable<AgentTurnResult["pendingApprovals"]>[number] & {
               summary?: string;
@@ -3832,63 +3769,35 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
             }
           > = [...(result.pendingApprovals ?? []), ...quarantineReleaseApprovals];
           for (const pa of turnApprovals) {
-            const blocks = approvalBlocksInput(pa.kind, outcome);
-            const grantModes = pa.grantModes
-              ? {
-                  grantModes: {
-                    session: resolution.approvalGrantModes.session && pa.grantModes.session,
-                    always: resolution.approvalGrantModes.always && pa.grantModes.always,
-                  },
-                }
-              : grantModesField;
-            const command = pa.command;
             const requestId = commandApprovalId(
               session.id,
               pa.screenedOutput
-                ? `${command}:${hashId([pa.screenedOutput.tool, pa.screenedOutput.text, pa.screenedOutput.sourceScopeId ?? scopeId], 64)}`
-                : command,
+                ? `${pa.command}:${hashId([pa.screenedOutput.tool, pa.screenedOutput.text, pa.screenedOutput.sourceScopeId ?? scopeId], 64)}`
+                : pa.command,
               pa.approvalKey,
             );
-            const summary = pa.summary ?? (await approvalSummary(scopeId, command, pa.reason, pa.purpose));
-            prepared.push({
+            issued.push([
               requestId,
-              record: {
+              {
                 sessionId: session.id,
-                command,
-                createdAt: Date.now(),
+                command: pa.command,
                 reason: pa.reason,
-                request,
-                blocksInput: blocks,
-                ...grantModes,
-                ...(pa.matched ? { matched: pa.matched } : {}),
-                ...(pa.purpose ? { purpose: pa.purpose } : {}),
-                ...(summary ? { summary } : {}),
-                ...(pa.summaryDetail ? { summaryDetail: pa.summaryDetail } : {}),
-                ...(pa.screenedOutput ? { screenedOutput: pa.screenedOutput } : {}),
-                ...(pa.approvalKey ? { approvalKey: pa.approvalKey } : {}),
-                ...(pa.kind ? { kind: pa.kind } : {}),
+                blocksInput: approvalBlocksInput(pa.kind, outcome),
+                grantModes: pa.grantModes,
+                matched: pa.matched,
+                purpose: pa.purpose,
+                summary: pa.summary ?? (await approvalSummary(scopeId, pa.command, pa.reason, pa.purpose)),
+                summaryDetail: pa.summaryDetail,
+                screenedOutput: pa.screenedOutput,
+                approvalKey: pa.approvalKey,
+                kind: pa.kind,
               },
-              approval: {
-                requestId,
-                command,
-                reason: pa.reason,
-                blocksInput: blocks,
-                ...grantModes,
-                ...(pa.matched ? { matched: pa.matched } : {}),
-                ...(pa.purpose ? { purpose: pa.purpose } : {}),
-                ...(summary ? { summary } : {}),
-                ...(pa.summaryDetail ? { summaryDetail: pa.summaryDetail } : {}),
-                ...(pa.approvalKey ? { approvalKey: pa.approvalKey } : {}),
-                ...(pa.kind ? { kind: pa.kind } : {}),
-              },
-            });
+            ]);
           }
-          await withManagedRosterVersion(async () => {
-            for (const item of prepared) {
-              await pending.put(item.requestId, item.record);
-              approvals.push(item.approval);
-            }
-            return true;
+          const approvals = await withManagedRosterVersion(async () => {
+            const issuedApprovals: PendingApproval[] = [];
+            for (const [requestId, fields] of issued) issuedApprovals.push(await issueApproval(requestId, fields));
+            return issuedApprovals;
           });
           finalResult = turnCompleted
             ? {
@@ -3933,60 +3842,28 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
         await deps.errors?.flush();
         return finalResult;
       } catch (err) {
-        if (err instanceof ProjectRosterChanged) {
-          return {
-            status: "refused",
-            sessionId: session.id,
-            reason: "project membership changed; retry from the current project",
-          };
-        }
+        if (err instanceof ProjectRosterChanged) return rosterChanged(session.id);
         if (err instanceof NeedsApproval) {
-          const requestId = commandApprovalId(session.id, err.command);
-          const grantModesField = {
-            grantModes: {
-              session: resolution.approvalGrantModes.session && (err.grantModes?.session ?? true),
-              always: resolution.approvalGrantModes.always && (err.grantModes?.always ?? true),
-            },
-          };
           const summary = await approvalSummary(scopeId, err.command, err.approvalReason);
+          let approval: PendingApproval;
           try {
-            await withManagedRosterVersion(async () => {
-              await pending.put(requestId, {
+            approval = await withManagedRosterVersion(() =>
+              issueApproval(commandApprovalId(session.id, err.command), {
                 sessionId: session.id,
                 command: err.command,
-                createdAt: Date.now(),
                 reason: err.approvalReason,
-                ...grantModesField,
-                ...(err.matched ? { matched: err.matched } : {}),
-                ...(summary ? { summary } : {}),
-                ...(err.approvalKey ? { approvalKey: err.approvalKey } : {}),
-                request: replayableRequest(input),
+                grantModes: err.grantModes,
+                matched: err.matched,
+                summary,
+                approvalKey: err.approvalKey,
                 blocksInput: true,
                 kind: err.kind,
-              });
-              return true;
-            });
+              }),
+            );
           } catch (writeErr) {
-            if (writeErr instanceof ProjectRosterChanged) {
-              return {
-                status: "refused",
-                sessionId: session.id,
-                reason: "project membership changed; retry from the current project",
-              };
-            }
+            if (writeErr instanceof ProjectRosterChanged) return rosterChanged(session.id);
             throw writeErr;
           }
-          const approval: PendingApproval = {
-            requestId,
-            command: err.command,
-            reason: err.approvalReason,
-            ...grantModesField,
-            ...(err.matched ? { matched: err.matched } : {}),
-            ...(summary ? { summary } : {}),
-            ...(err.approvalKey ? { approvalKey: err.approvalKey } : {}),
-            ...(err.kind ? { kind: err.kind } : {}),
-            blocksInput: true,
-          };
           return { status: "pending_approval", sessionId: session.id, pendingApprovals: [approval] };
         }
         if (err instanceof CommandDenied) {

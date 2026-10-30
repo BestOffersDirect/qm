@@ -1,6 +1,7 @@
 import type { Agent, AgentTurnInput } from "../src/agent/agent.ts";
 import { createMemoryBlobTransferStore, type BlobTransferStore } from "../src/persistence/blob-transfer.ts";
 import type { SecurityScreener } from "../src/security/security-screener.ts";
+import { MAX_SCREEN_CHARS } from "../src/security/security-posture.ts";
 import { createSkillBundleStore, type SkillBundleStore } from "../src/skills/skill-bundle-store.ts";
 import { verifyCapabilityToken } from "../src/auth/capability-token.ts";
 import { test } from "node:test";
@@ -996,6 +997,64 @@ test("steered documents use the inbound security screen before writing their con
     writes.some((path) => path.endsWith("unsafe.txt")),
     false,
   );
+});
+
+test("inbound files are screened in bounded chunks with the request they arrived with, at turn start and on steer, and oversized files are left unscreened", async () => {
+  const blobTransfer = createMemoryBlobTransferStore();
+  const large = await blobTransfer.put(Buffer.from('"quoted","cells"\n'.repeat(800)));
+  const small = await blobTransfer.put(Buffer.from("plain notes"));
+  const oversized = await blobTransfer.put(Buffer.from("x".repeat(210_000)));
+  const sandbox: Sandbox = {
+    ...readSandbox(),
+    removeDir: async () => {},
+    listDir: async () => [],
+    writeFile: async () => {},
+    writeFileBytes: async () => {},
+  };
+  const agent = createMockAgent();
+  agent.runTurn = async (turn) => {
+    await turn.prepareSteer!("steer request", {
+      surface: "web",
+      actor: { externalId: actor.id },
+      conversation: { kind: "dm", threadRef: "screen-requests" },
+      text: "steer request",
+      attachments: [{ name: "later.txt", mimetype: "text/plain", ...small }],
+    });
+    return { reply: "done" };
+  };
+  const fileScreens: Array<{ request: unknown; head: string; length: number }> = [];
+  const securityScreener: SecurityScreener = {
+    provider: "test",
+    classify: async ({ payload, metadata }) => {
+      const [chunk] = JSON.parse(payload) as Array<{ source: string; content: string }>;
+      if (chunk?.source === "tool_result:inbound_file")
+        fileScreens.push({
+          request: (metadata?.request as { text?: string } | undefined)?.text,
+          head: chunk.content.slice(0, 22),
+          length: payload.length,
+        });
+      return { verdict: { decision: "auto" }, score: 0, threshold: 1 };
+    },
+  };
+  const { orchestrator } = buildOrchestrator({ agent, sandbox, blobTransfer, securityScreener });
+  const result = await orchestrator.handleTurn({
+    ...dm("screen-requests", "turn request"),
+    attachments: [
+      { name: "first.csv", mimetype: "text/csv", ...large },
+      { name: "huge.txt", mimetype: "text/plain", ...oversized },
+    ],
+  });
+  assert.equal(result.status, "ok", result.reason);
+  const turnStart = fileScreens.filter((screen) => screen.request === "turn request");
+  assert.ok(turnStart.length > 1);
+  assert.equal(turnStart[0]!.head, '{"name":"first.csv","m');
+  assert.ok(fileScreens.every((screen) => screen.length <= MAX_SCREEN_CHARS));
+  assert.deepEqual(
+    fileScreens.filter((screen) => screen.request === "steer request").map((screen) => screen.head),
+    ['{"name":"later.txt","m'],
+  );
+  assert.equal(fileScreens.length, turnStart.length + 1);
+  assert.ok(fileScreens.every((screen) => !screen.head.startsWith('{"name":"huge.txt"')));
 });
 
 for (const budget of ["count", "bytes", "reupload", "retry"] as const) {
