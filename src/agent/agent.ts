@@ -15,9 +15,9 @@ import type {
 import type { LlmCallUsage, LlmTransportMeta, NewEntry } from "../sessions/session-store.ts";
 import type { OverheardEntryPayload } from "./replay.ts";
 import type { GoalRecord } from "./goal.ts";
-import type { GrindMeter } from "./grind.ts";
+import type { GrindMeter } from "./goal.ts";
 import type { McpToolDescriptor } from "../mcp/mcp-tool-service.ts";
-import type { ProviderKeys } from "./agent-run.ts";
+import type { ProviderKeys } from "../model/model-runtime.ts";
 import type { ToolContext } from "../tools/primitives.ts";
 import type { SecurityScreenVerdict, ToolResultScreen, ToolResultScreenInput } from "../security/security-posture.ts";
 
@@ -31,29 +31,6 @@ interface TurnImage {
   mimeType: string;
   dataBase64: string;
   artifactId?: string;
-}
-
-export function promptEnvelopeWithoutHistory(payload: unknown): unknown {
-  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return payload;
-  const envelope: Record<string, unknown> = {};
-  for (const [key, value] of Object.entries(payload)) {
-    if (key === "contents") continue;
-    if (key === "messages" || key === "input") {
-      if (Array.isArray(value)) {
-        const instructions = value.filter(
-          (item: unknown) =>
-            item !== null &&
-            typeof item === "object" &&
-            "role" in item &&
-            (item.role === "system" || item.role === "developer"),
-        );
-        if (instructions.length) envelope[key] = instructions;
-      }
-    } else {
-      envelope[key] = key === "context" ? promptEnvelopeWithoutHistory(value) : value;
-    }
-  }
-  return envelope;
 }
 
 export interface TurnLlmRequestRecord {

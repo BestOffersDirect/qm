@@ -301,7 +301,7 @@ test("live admin lifecycle is authorized, audited, immediately selectable and re
 });
 
 import { createServer } from "node:http";
-import { oneShot, createAgent, wantsFastMode } from "../src/agent/agent-run.ts";
+import { oneShot, createAgent } from "../src/agent/agent-run.ts";
 import { setProviderBaseUrls } from "../src/model/provider-endpoints.ts";
 import { calculateCost } from "@earendil-works/pi-ai";
 
@@ -492,6 +492,7 @@ test("overlay resolution preserves canonical personal endpoints and upstream bui
 
 import { createMemoryConfigStore } from "../src/resolution/config-store.ts";
 import { resolveRuntimeChoice } from "../src/agent/runtime-choice.ts";
+import { wantsFastMode } from "../src/model/model-runtime.ts";
 
 test("runtime normalization preserves native capabilities and reflects overlay capability edits", async () => {
   const config = createMemoryConfigStore("default-org");
@@ -501,10 +502,10 @@ test("runtime normalization preserves native capabilities and reflects overlay c
   const overlay = validateModelOverlay({ ...spec, provider: "anthropic", template: "claude-opus-4-8", fastMode: true });
   setModelOverlays([overlay]);
   const requested = { modelId: MODEL_ID, effortLevel: "max", fastMode: true };
-  assert.deepEqual(resolveRuntimeChoice(config, org, scope, fallback, requested), requested);
+  assert.deepEqual(await resolveRuntimeChoice(config, org, scope, fallback, requested), requested);
   setModelOverlays([{ ...overlay, fastMode: false }]);
-  assert.equal(resolveRuntimeChoice(config, org, scope, fallback, requested).fastMode, false);
-  const native = resolveRuntimeChoice(config, org, scope, fallback, {
+  assert.equal((await resolveRuntimeChoice(config, org, scope, fallback, requested)).fastMode, false);
+  const native = await resolveRuntimeChoice(config, org, scope, fallback, {
     modelId: "claude-opus-4-8",
     effortLevel: "max",
     fastMode: true,

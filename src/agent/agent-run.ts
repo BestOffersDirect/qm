@@ -1,4 +1,11 @@
-import { claudeSubscriptionBetas } from "../model/claude-subscription.ts";
+import {
+  applyFastSpeed,
+  buildModelRuntime,
+  piUsageToCallUsage,
+  wantsFastMode,
+  withRequestHeaders,
+  type ProviderKeys,
+} from "../model/model-runtime.ts";
 import {
   recordSteerIntake,
   recordStoppedTurn,
@@ -8,37 +15,28 @@ import {
   type SteerIntake,
 } from "./turn-support.ts";
 import { withDocumentInputs, type DocumentModel } from "./document-inputs.ts";
+import { guardOutputBudget, sanitizeLlmPayload, trimPayloadToByteBudget } from "./provider-payload.ts";
 import type { DocumentInput } from "../core/document-inputs.ts";
 import { documentStub } from "../core/document-kinds.ts";
-import { gatewayModelsJson, gatewayModelsVersion } from "../model/gateway-models.ts";
-import { Type } from "typebox";
-import { mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   createAgentSession,
   DefaultResourceLoader,
-  ModelRuntime,
   SessionManager,
   SettingsManager,
   type ToolDefinition,
   type AgentSession,
 } from "@earendil-works/pi-coding-agent";
 import {
-  calculateCost,
-  InMemoryCredentialStore,
   type Api,
   type AssistantMessage,
-  type Context,
   type Model,
   type ModelThinkingLevel,
-  type ModelsApiStreamOptions,
-  type ModelsSimpleStreamOptions,
-  type ProviderHeaders,
   type ToolResultMessage,
   type Usage,
 } from "@earendil-works/pi-ai";
-import { getServiceTierCostMultiplier } from "@earendil-works/pi-ai/api/openai-responses";
 import { baseModelProviders, configuredModel, CONFIG_DEFAULTS, type Config } from "../config.ts";
 
 type LegacyThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
@@ -56,10 +54,9 @@ const TURN_EFFORT_LEVELS = new Set<string>([
   "adaptive",
 ]);
 import type { ConversationTurn, ScopeId, SessionEntry } from "../types.ts";
-import type { LlmCallUsage, LlmTransportMeta } from "../sessions/session-store.ts";
+import type { LlmCallUsage } from "../sessions/session-store.ts";
 import { NonRetryableTurnError, ProviderTurnError, TitleRejected } from "../core/turn-error.ts";
-import { providerTurnError } from "./provider-error.ts";
-import { MAX_LLM_REQUEST_BYTES } from "../core/attachments.ts";
+import { providerTurnError } from "../model/provider-error.ts";
 import { asError, swallow, swallowAs } from "../util/errors.ts";
 import { startPhase } from "../../plugins/chassis/src/error-reporting.ts";
 import {
@@ -71,29 +68,13 @@ import {
   modelSupportsAdaptiveThinking,
   modelSupportsProviderDefault,
   modelDisplayName,
-  modelRequestOverrides,
   resolveModel,
   getRequiredModel,
-  modelSupportsFastMode,
   contextTokenBudgetForModel,
-  CODEX_SUBSCRIPTION_PROVIDER,
-  codexProviderModelId,
   modelHasPrices,
 } from "../model/pi-models.ts";
+import { modelGatewayRequest, type ModelGatewayTransportConfig } from "../model/provider-endpoints.ts";
 import {
-  customModelsJson,
-  customProvidersVersion,
-  hasCustomModelPrefix,
-  resolveCustomModel,
-} from "../model/custom-providers.ts";
-import {
-  GatewayModelUnavailableError,
-  ModelUnavailableError,
-  modelGatewayRequest,
-  type ModelGatewayTransportConfig,
-} from "../model/provider-endpoints.ts";
-import {
-  promptEnvelopeWithoutHistory,
   type Agent,
   type CompactInput,
   type DetectInput,
@@ -111,11 +92,9 @@ import {
 } from "./agent-tools.ts";
 import { startSignalPoll, type RunSignalStore } from "../runs/run-signal-store.ts";
 import {
-  planColdStartSeed,
   reconstructMessagesFromHistory,
   dayMarkerPrefix,
   recordedMessageTimestamps,
-  replayPreamble,
   userPromptText,
   seedPriorTurns,
   legacyAssistant,
@@ -125,7 +104,7 @@ import {
 } from "./replay.ts";
 import { estimateHistoryTokens } from "./context-compaction.ts";
 import { createStepRecorder, recordingTools, type StepRecorder } from "./step-recorder.ts";
-import { ELIDED_IMAGE_TEXT, restoreReplayImages, type ReplayImageLoader } from "./replay-images.ts";
+import { restoreReplayImages, type ReplayImageLoader } from "./replay-images.ts";
 import { summarizeHistory } from "./history-summary.ts";
 import { countTokens } from "../util/tokens.ts";
 import {
@@ -134,9 +113,11 @@ import {
   SECURITY_SCREEN_SYSTEM_PROMPT,
 } from "../security/security-posture.ts";
 import { errMessage } from "../util/errors.ts";
-import { createGrindMeter, meterGrindCall } from "./grind.ts";
+
 import {
   createFloorCapPolicy,
+  createGrindMeter,
+  meterGrindCall,
   bankGoalTurn,
   enforceGoal,
   goalPausedNote,
@@ -413,53 +394,6 @@ interface TurnSession {
   ephemeralCwd?: string;
 }
 
-export function piUsageToCallUsage(
-  u: Partial<Usage> | undefined,
-  model: Model<Api> | undefined,
-  fast: boolean | undefined,
-  servedTier: string | undefined,
-): LlmCallUsage | null {
-  if (!u) return null;
-  const row: LlmCallUsage = {
-    input: u.input ?? 0,
-    output: u.output ?? 0,
-    cacheRead: u.cacheRead ?? 0,
-    cacheWrite: u.cacheWrite ?? 0,
-    totalTokens: u.totalTokens ?? 0,
-    costUsd: u.cost?.total ?? 0,
-  };
-  const card = model?.cost ? servedTierCard(model, fast, servedTier) : undefined;
-  if (!card) return row;
-  const priced: Usage = {
-    input: row.input,
-    output: row.output,
-    cacheRead: row.cacheRead,
-    cacheWrite: row.cacheWrite,
-    ...(typeof u.cacheWrite1h === "number" ? { cacheWrite1h: Math.min(u.cacheWrite1h, row.cacheWrite) } : {}),
-    totalTokens: row.totalTokens,
-    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-  };
-  row.costUsd = calculateCost(card, priced).total;
-  return row;
-}
-
-function servedTierCard(
-  model: Model<Api>,
-  fast: boolean | undefined,
-  servedTier: string | undefined,
-): Model<Api> | undefined {
-  const request = modelRequestOverrides(model.id);
-  if (request && servedTier && servedTier !== request.service_tier) {
-    const base = resolveModel(request.model);
-    return base?.cost
-      ? ({ ...base, cost: scaleCost(base.cost, getServiceTierCostMultiplier(base, servedTier)) } as Model<Api>)
-      : undefined;
-  }
-  return fast && !servedTier
-    ? ({ ...model, cost: scaleCost(model.cost, FAST_COST_MULTIPLIER) } as Model<Api>)
-    : undefined;
-}
-
 function sumCacheUsage(
   usages: ReadonlyArray<LlmCallUsage | null>,
 ): { cacheRead: number; cacheWrite: number; uncachedInput: number } | null {
@@ -484,8 +418,6 @@ interface IsolatedResources {
   agentDir: string;
   ephemeralCwd?: string;
 }
-
-const MAX_CAPTURED_PAYLOAD_CHARS = 2_000_000;
 
 type PiPayloadHook = (payload: unknown, model: unknown) => unknown | Promise<unknown>;
 type PiResponseHook = (
@@ -543,186 +475,6 @@ export function seedRawMessagesIntoSession(session: unknown, messages: readonly 
       }
     }
   }
-}
-
-const LLM_REQUEST_TRIM_SLACK_BYTES = 3_000_000;
-
-function inlineBinaryData(b: unknown): string | undefined {
-  const block = b as {
-    type?: string;
-    source?: { type?: string; data?: unknown };
-    image_url?: unknown;
-    file_data?: unknown;
-    file?: { file_data?: unknown };
-    inlineData?: { mimeType?: unknown; data?: unknown };
-  };
-  if (
-    (block?.type === "image" || block?.type === "document") &&
-    block.source?.type === "base64" &&
-    typeof block.source.data === "string"
-  )
-    return block.source.data;
-  if (block?.type === "input_image" && typeof block.image_url === "string" && block.image_url.startsWith("data:"))
-    return block.image_url;
-  if (block?.type === "input_file" && typeof block.file_data === "string") return block.file_data;
-  if (block?.type === "file" && typeof block.file?.file_data === "string") return block.file.file_data;
-  if (typeof block?.inlineData?.mimeType === "string" && typeof block.inlineData.data === "string")
-    return block.inlineData.data;
-  return undefined;
-}
-
-function jsonBytesUpperBound(value: unknown, binary?: string): number {
-  if (typeof value === "string") {
-    if (value !== binary) return value.length * 6 + 2;
-    const header = value.startsWith("data:") ? value.indexOf(",") + 1 : 0;
-    return header * 6 + value.length - header + 2;
-  }
-  if (!value || typeof value !== "object") return 24;
-  let sum = 2;
-  if (Array.isArray(value)) {
-    for (const item of value) sum += jsonBytesUpperBound(item, binary) + 1;
-    return sum;
-  }
-  if (typeof (value as { toJSON?: unknown }).toJSON === "function") return Number.POSITIVE_INFINITY;
-  const data = inlineBinaryData(value) ?? binary;
-  for (const key of Object.keys(value))
-    sum += key.length * 6 + 4 + jsonBytesUpperBound((value as Record<string, unknown>)[key], data);
-  return sum;
-}
-
-export function trimPayloadToByteBudget(payload: unknown, maxBytes: number = MAX_LLM_REQUEST_BYTES): unknown {
-  const p = payload as Record<string, unknown> | null;
-  let listKey: "messages" | "input" | "contents" | undefined;
-  if (Array.isArray(p?.messages)) listKey = "messages";
-  else if (Array.isArray(p?.input)) listKey = "input";
-  else if (Array.isArray(p?.contents)) listKey = "contents";
-  if (!p || !listKey) return payload;
-  if (jsonBytesUpperBound(payload) <= maxBytes) return payload;
-  const totalBytes = Buffer.byteLength(JSON.stringify(payload));
-  if (totalBytes <= maxBytes) return payload;
-
-  const inlineImageChars = (b: unknown): number => inlineBinaryData(b)?.length ?? 0;
-  const placeholder = (b: unknown) => {
-    const block = b as { type?: string; cache_control?: unknown };
-    const cache = block.cache_control !== undefined ? { cache_control: block.cache_control } : undefined;
-    const text =
-      ["document", "input_file", "file"].includes(block.type ?? "") || (b as { inlineData?: unknown })?.inlineData
-        ? "[Document omitted because the model request exceeds its byte budget. Do not claim to have read it.]"
-        : ELIDED_IMAGE_TEXT;
-    if (listKey === "contents") return { text };
-    return block.type === "input_image" || block.type === "input_file"
-      ? { type: "input_text", text }
-      : { type: "text", text, ...cache };
-  };
-  let toShed = totalBytes - (maxBytes - LLM_REQUEST_TRIM_SLACK_BYTES);
-  const trimContent = (content: unknown): unknown => {
-    if (!Array.isArray(content)) return content;
-    let changed = false;
-    const out = content.map((block) => {
-      const imageChars = inlineImageChars(block);
-      if (imageChars > 0 && toShed > 0) {
-        toShed -= imageChars - ELIDED_IMAGE_TEXT.length;
-        changed = true;
-        return placeholder(block);
-      }
-      const nested = block as { content?: unknown };
-      if (Array.isArray(nested?.content)) {
-        const inner = trimContent(nested.content);
-        if (inner !== nested.content) {
-          changed = true;
-          return { ...(block as Record<string, unknown>), content: inner };
-        }
-      }
-      return block;
-    });
-    return changed ? out : content;
-  };
-
-  const items = (p[listKey] as unknown[]).map((m) => {
-    if (toShed <= 0) return m;
-    const msg = m as { content?: unknown; parts?: unknown };
-    const key = listKey === "contents" ? "parts" : "content";
-    if (!Array.isArray(msg?.[key])) return m;
-    const content = trimContent(msg[key]);
-    return content === msg[key] ? m : { ...(m as Record<string, unknown>), [key]: content };
-  });
-  return { ...p, [listKey]: items };
-}
-
-function redactImageBytes(v: unknown): unknown {
-  if (Array.isArray(v)) return v.map(redactImageBytes);
-  if (v && typeof v === "object") {
-    const o = v as Record<string, unknown>;
-    if ((o.type === "image" || o.type === "document") && o.source && typeof o.source === "object") {
-      const src = o.source as Record<string, unknown>;
-      if (typeof src.data === "string") {
-        return {
-          ...o,
-          source: { ...src, data: `<base64 ${String(src.media_type ?? "image")} omitted: ${src.data.length} chars>` },
-        };
-      }
-    }
-    if (o.type === "thinking" && typeof o.signature === "string") {
-      return { ...o, signature: `<signature ${o.signature.length} chars omitted>` };
-    }
-    if (o.type === "redacted_thinking" && typeof o.data === "string") {
-      return { ...o, data: `<redacted_thinking ${o.data.length} chars omitted>` };
-    }
-    const out: Record<string, unknown> = {};
-    for (const [k, val] of Object.entries(o)) {
-      out[k] =
-        typeof val === "string" &&
-        (k === "file_data" ||
-          (k === "image_url" && val.startsWith("data:")) ||
-          (k === "data" && typeof o.mimeType === "string"))
-          ? `<file bytes omitted: ${val.length} chars>`
-          : redactImageBytes(val);
-    }
-    return out;
-  }
-  return v;
-}
-
-export function transportFromModel(model: unknown): LlmTransportMeta | undefined {
-  if (!model || typeof model !== "object") return undefined;
-  const m = model as { id?: unknown; headers?: unknown };
-  const out: LlmTransportMeta = {};
-  if (typeof m.id === "string") out.modelId = m.id;
-  if (m.headers && typeof m.headers === "object") {
-    const headers: Record<string, string> = {};
-    for (const [k, v] of Object.entries(m.headers as Record<string, unknown>)) {
-      if (typeof v === "string") headers[k] = v;
-    }
-    if (Object.keys(headers).length) out.headers = headers;
-  }
-  return out.modelId || out.headers ? out : undefined;
-}
-
-export function sanitizeLlmPayload(
-  payload: unknown,
-  model?: unknown,
-): { envelope: unknown; truncated: boolean; transport?: LlmTransportMeta } {
-  const transport = transportFromModel(model);
-  const withTransport = (r: { envelope: unknown; truncated: boolean }) => (transport ? { ...r, transport } : r);
-  let redacted: unknown;
-  try {
-    redacted = redactImageBytes(promptEnvelopeWithoutHistory(payload));
-  } catch {
-    return withTransport({ envelope: { note: "payload not capturable" }, truncated: true });
-  }
-  let json: string;
-  try {
-    json = JSON.stringify(redacted);
-  } catch {
-    return withTransport({ envelope: { note: "payload not serializable" }, truncated: true });
-  }
-  if (json.length > MAX_CAPTURED_PAYLOAD_CHARS) {
-    return withTransport({
-      envelope: { truncated: true, bytes: json.length, preview: json.slice(0, MAX_CAPTURED_PAYLOAD_CHARS) },
-      truncated: true,
-    });
-  }
-  return withTransport({ envelope: redacted, truncated: false });
 }
 
 function textFromContent(content: unknown): string {
@@ -823,11 +575,6 @@ export function piTurnError(session: AssistantTextSession, thrown: unknown, mess
   const detailed = piAssistantFailure(messagesSince(session, messagesBefore));
   if (detailed) return detailed;
   return thrown instanceof Error ? thrown : new Error(String(thrown));
-}
-
-export function providerRefusalError(session: AssistantTextSession, messagesBefore?: number): string | null {
-  const err = piAssistantFailure(messagesSince(session, messagesBefore));
-  return err && FALLBACK_CODES.has(err.code) ? err.message : null;
 }
 
 export const REFUSAL_FALLBACK_MODEL_IDS = ["claude-opus-5", "claude-sonnet-5"] as const;
@@ -979,154 +726,6 @@ function removeIsolatedDirs(dirs: { agentDir: string; ephemeralCwd?: string }): 
   }
 }
 
-export interface ProviderKeys {
-  anthropic?: string;
-  openai?: string;
-  openrouter?: string;
-  [provider: string]: string | undefined;
-}
-
-let cachedCustomModels: { version: number; path: string | null } | null = null;
-function customModelsPath(): string | null {
-  const version = customProvidersVersion() + gatewayModelsVersion();
-  if (cachedCustomModels?.version === version) return cachedCustomModels.path;
-  const providers = { ...customModelsJson()?.providers, ...gatewayModelsJson() };
-  const custom = Object.keys(providers).length ? { providers } : undefined;
-  let path: string | null = null;
-  if (custom) {
-    path = join(mkdtempSync(join(tmpdir(), "pi-custom-models-")), "models.json");
-    writeFileSync(path, JSON.stringify(custom));
-  }
-  cachedCustomModels = { version, path };
-  return path;
-}
-
-export async function buildModelRuntime(
-  keys: ProviderKeys | string,
-  modelGateway?: ModelGatewayTransportConfig,
-  cacheRetention?: "long",
-): Promise<ModelRuntime> {
-  await modelGateway?.refresh?.();
-  const { [CODEX_SUBSCRIPTION_PROVIDER]: subscriptionToken, ...apiKeys }: ProviderKeys =
-    typeof keys === "string" ? { anthropic: keys } : keys;
-  const credentials = new InMemoryCredentialStore();
-  if (subscriptionToken)
-    await credentials.modify(CODEX_SUBSCRIPTION_PROVIDER, async () => ({
-      type: "oauth",
-      access: subscriptionToken,
-      refresh: "",
-      expires: Number.MAX_SAFE_INTEGER,
-    }));
-  const modelsPath = customModelsPath();
-  const runtime = await ModelRuntime.create({ credentials, modelsPath });
-  for (const [provider, apiKey] of Object.entries(apiKeys)) {
-    if (apiKey) await runtime.setRuntimeApiKey(provider, apiKey, { allowNetwork: false });
-  }
-  if (modelGateway) {
-    const providers = new Set(
-      Object.keys(modelGateway.models).flatMap((id) => {
-        const model = resolveModel(id);
-        return model ? [model.provider] : [];
-      }),
-    );
-    const hasConfiguredAuth = runtime.hasConfiguredAuth.bind(runtime);
-    runtime.hasConfiguredAuth = (provider) => providers.has(provider) || hasConfiguredAuth(provider);
-    const getAuth = runtime.getAuth.bind(runtime);
-    runtime.getAuth = (async (model, overrides) => {
-      if (typeof model === "string") return getAuth(model, overrides);
-      const request = modelGatewayRequest(modelGateway, model);
-      if (request)
-        return {
-          auth: { apiKey: request.apiKey, headers: { ...model.headers, ...request.headers } },
-          source: "model gateway",
-        };
-      return getAuth(model, overrides);
-    }) as typeof runtime.getAuth;
-  }
-  const retained = <T extends object | undefined>(options: T): T =>
-    cacheRetention ? ({ ...options, cacheRetention } as T) : options;
-  const wireModelId = <T extends Pick<ModelsSimpleStreamOptions, "onPayload"> | undefined>(
-    options: T,
-    model: Model<Api>,
-    target: () => Promise<string>,
-  ): T =>
-    ({
-      ...options,
-      onPayload: async (payload: unknown) => {
-        const transformed = options?.onPayload ? await options.onPayload(payload, model) : undefined;
-        const body = transformed === undefined ? payload : transformed;
-        if (!body || typeof body !== "object" || Array.isArray(body)) {
-          throw new Error("model request payload must be an object");
-        }
-        return { ...body, ...modelRequestOverrides(model.id), model: await target() };
-      },
-    }) as T;
-  const route = <T extends ModelsSimpleStreamOptions | undefined>(
-    model: Model<Api>,
-    options: T,
-  ): { model: Model<Api>; options: T } => {
-    const request = modelGatewayRequest(modelGateway, model);
-    if (!request) {
-      const custom = resolveCustomModel(model.id);
-      const providerModelId =
-        model.provider === CODEX_SUBSCRIPTION_PROVIDER
-          ? codexProviderModelId(model.id)
-          : (modelRequestOverrides(model.id)?.model ?? custom?.upstreamId ?? model.id);
-      const unregistered = !custom && hasCustomModelPrefix(model.id);
-      const candidate = withRequestHeaders(model, true, false, apiKeys[String(model.provider)]);
-      const passthrough = {
-        ...retained(options),
-        onPayload: async (payload: unknown) => {
-          const transformed = options?.onPayload ? await options.onPayload(payload, model) : undefined;
-          return applyThinkingBinding(transformed === undefined ? payload : transformed, candidate);
-        },
-      } as T;
-      return {
-        model: candidate,
-        options:
-          providerModelId === model.id && !unregistered
-            ? passthrough
-            : wireModelId(passthrough, model, async () => {
-                if (unregistered) throw new ModelUnavailableError(model.id);
-                return providerModelId;
-              }),
-      };
-    }
-    const routed = {
-      ...retained(options),
-      apiKey: request.apiKey,
-      transformHeaders: async (headers: ProviderHeaders) => ({
-        ...(options?.transformHeaders ? await options.transformHeaders(headers) : headers),
-        ...request.headers,
-      }),
-    } as T;
-    return {
-      model: request.model,
-      options: wireModelId(routed, model, async () => {
-        await modelGateway?.refresh?.();
-        const current = modelGatewayRequest(modelGateway, model);
-        if (!current) throw new GatewayModelUnavailableError(model.id);
-        return current.target;
-      }),
-    };
-  };
-  const stream = runtime.stream.bind(runtime);
-  runtime.stream = (<TApi extends Api>(
-    model: Model<TApi>,
-    context: Context,
-    options?: ModelsApiStreamOptions<TApi>,
-  ) => {
-    const routed = route(model, options as ModelsSimpleStreamOptions | undefined);
-    return stream(routed.model as Model<TApi>, context, routed.options as unknown as ModelsApiStreamOptions<TApi>);
-  }) as typeof runtime.stream;
-  const streamSimple = runtime.streamSimple.bind(runtime);
-  runtime.streamSimple = ((model: Model<Api>, context: Context, options?: ModelsSimpleStreamOptions) => {
-    const routed = route(model, options);
-    return streamSimple(routed.model, context, routed.options);
-  }) as typeof runtime.streamSimple;
-  return runtime;
-}
-
 export async function oneShot(
   prefix: string,
   model: Model<Api>,
@@ -1209,158 +808,6 @@ async function recordOneShotCall(
   }
 }
 
-export async function probeModel(
-  model: Model<Api>,
-  keys: ProviderKeys,
-  signal: AbortSignal,
-  fastMode = false,
-  modelGateway?: ModelGatewayTransportConfig,
-): Promise<void> {
-  const runtime = await buildModelRuntime(keys, modelGateway);
-  signal.throwIfAborted();
-  const candidate = withRequestHeaders(model, !modelGateway?.models[model.id], fastMode);
-  const response = await runtime
-    .streamSimple(
-      candidate,
-      {
-        systemPrompt: "This is a connection check. Reply OK. Do not call tools.",
-        messages: [{ role: "user", content: "Reply OK.", timestamp: Date.now() }],
-        tools: [
-          {
-            name: "connection_check",
-            description: "A synthetic tool for verifying request compatibility. Do not call it.",
-            parameters: Type.Object({}),
-          },
-        ],
-      },
-      {
-        maxTokens: Math.min(128, model.maxTokens),
-        signal,
-        maxRetryDelayMs: 1,
-        onPayload: (payload) => applyFastSpeed(payload, fastMode, model.api),
-      },
-    )
-    .result();
-  signal.throwIfAborted();
-  if (response.stopReason === "aborted") throw new DOMException("Model verification was aborted", "AbortError");
-  if (response.stopReason === "error") throw providerTurnError(response);
-  if (response.stopReason !== "stop" || !response.content.some((part) => part.type === "text" && part.text.trim()))
-    throw new Error("Model verification did not produce a completed text response");
-}
-
-const FAST_MODE_BETA = "fast-mode-2026-02-01";
-const THINKING_BINDING_BETA = "thinking-binding-controls-2026-08-01";
-const THINKING_BINDING = { prefix_mismatch_behavior: "drop_block" } as const;
-
-export const FAST_COST_MULTIPLIER = 2;
-
-export function scaleCost<T>(cost: T, factor: number): T {
-  if (!cost || typeof cost !== "object") return cost;
-  const out: Record<string, unknown> = { ...(cost as Record<string, unknown>) };
-  for (const key of ["input", "output", "cacheRead", "cacheWrite"]) {
-    if (typeof out[key] === "number") out[key] = (out[key] as number) * factor;
-  }
-  if (Array.isArray(out.tiers)) out.tiers = out.tiers.map((t) => scaleCost(t, factor));
-  return out as T;
-}
-
-export { modelSupportsFastMode } from "../model/pi-models.ts";
-
-export function wantsFastMode(fastMode: boolean | undefined, modelId: string | undefined): boolean {
-  return fastMode === true && modelSupportsFastMode(modelId);
-}
-
-function thinkingBindingApplies(model: Pick<Model<Api>, "api" | "compat"> | undefined): boolean {
-  return (
-    model?.api === "anthropic-messages" &&
-    (model.compat as { forceAdaptiveThinking?: unknown } | undefined)?.forceAdaptiveThinking === true
-  );
-}
-
-export function applyThinkingBinding<T>(
-  payload: T,
-  model: (Pick<Model<Api>, "headers"> & Partial<Pick<Model<Api>, "thinkingLevelMap">>) | undefined,
-): T {
-  if (!payload || typeof payload !== "object") return payload;
-  if (!model?.headers?.["anthropic-beta"]?.split(",").includes(THINKING_BINDING_BETA)) return payload;
-  const thinking =
-    (payload as { thinking?: { type?: unknown } }).thinking ??
-    (model.thinkingLevelMap?.off === null ? { type: "adaptive", display: "summarized" } : undefined);
-  if (thinking?.type === "adaptive" || thinking?.type === "enabled") {
-    (payload as Record<string, unknown>).thinking = { ...thinking, block_binding: THINKING_BINDING };
-  }
-  return payload;
-}
-
-export function applyFastSpeed<T>(payload: T, fast: boolean | undefined, api?: string): T {
-  if (fast && payload && typeof payload === "object") {
-    if (api && api.toLowerCase().startsWith("openai")) {
-      (payload as Record<string, unknown>).service_tier = "priority";
-    } else {
-      (payload as Record<string, unknown>).speed = "fast";
-    }
-  }
-  return payload;
-}
-
-export const OUTPUT_BUDGET_FLOOR_TOKENS = 1_024;
-export const OUTPUT_GUARD_SAFETY_TOKENS = 4_096;
-const OUTPUT_GUARD_CHARS_PER_TOKEN = 4;
-const IMAGE_STAND_IN = "i".repeat(4_800);
-
-export type OutputBudgetGuardResult =
-  { kind: "ok" } | { kind: "raised"; from: number; to: number; estimatedPromptTokens: number };
-
-function estimatePayloadTokens(payload: Record<string, unknown>): number | undefined {
-  try {
-    const json = JSON.stringify(payload, function (this: unknown, key, value) {
-      if (typeof value !== "string" || value.length <= IMAGE_STAND_IN.length) return value;
-      const mediaType = (this as { media_type?: unknown } | null)?.media_type;
-      const anthropicImage = key === "data" && typeof mediaType === "string" && mediaType.startsWith("image/");
-      const openaiImage = (key === "url" || key === "image_url") && value.startsWith("data:image/");
-      const container = this as { media_type?: unknown; mimeType?: unknown; type?: unknown } | null;
-      const nativeDocument =
-        (key === "file_data" && value.startsWith("data:")) ||
-        (key === "data" &&
-          ((container?.type === "base64" && container.media_type === "application/pdf") ||
-            container?.mimeType === "application/pdf"));
-      return anthropicImage || openaiImage || nativeDocument ? IMAGE_STAND_IN : value;
-    });
-    if (typeof json !== "string") return undefined;
-    return Math.ceil(json.length / OUTPUT_GUARD_CHARS_PER_TOKEN);
-  } catch {
-    return undefined;
-  }
-}
-
-export function guardOutputBudget(payload: unknown, model: unknown): OutputBudgetGuardResult {
-  const p = payload as Record<string, unknown> | null;
-  if (!p || typeof p !== "object") return { kind: "ok" };
-  let capKey: "max_tokens" | "max_output_tokens" | "max_completion_tokens" | undefined;
-  if (typeof p.max_tokens === "number") capKey = "max_tokens";
-  else if (typeof p.max_output_tokens === "number") capKey = "max_output_tokens";
-  else if (typeof p.max_completion_tokens === "number") capKey = "max_completion_tokens";
-  if (capKey === undefined) return { kind: "ok" };
-  const cap = p[capKey] as number;
-  if (cap >= OUTPUT_BUDGET_FLOOR_TOKENS) return { kind: "ok" };
-  const m = model as { contextWindow?: number; maxTokens?: number } | null;
-  const contextWindow = m?.contextWindow;
-  if (typeof contextWindow !== "number" || !Number.isFinite(contextWindow) || contextWindow <= 0) return { kind: "ok" };
-  const estimatedPromptTokens = estimatePayloadTokens(p);
-  if (estimatedPromptTokens === undefined) return { kind: "ok" };
-  const available = contextWindow - estimatedPromptTokens - OUTPUT_GUARD_SAFETY_TOKENS;
-  if (available < OUTPUT_BUDGET_FLOOR_TOKENS) {
-    throw new Error(
-      `prompt is too long: estimated ${estimatedPromptTokens} tokens leave no output room in a ${contextWindow}-token window (output-budget guard)`,
-    );
-  }
-  const modelMax = typeof m?.maxTokens === "number" && m.maxTokens > 0 ? m.maxTokens : available;
-  const to = Math.min(modelMax, available);
-  if (to <= cap) return { kind: "ok" };
-  p[capKey] = to;
-  return { kind: "raised", from: cap, to, estimatedPromptTokens };
-}
-
 export function resolveConfiguredModelId(configured: string | undefined, defaultModelId?: string): string {
   for (const candidate of [configured, defaultModelId]) {
     if (!candidate) continue;
@@ -1368,22 +815,6 @@ export function resolveConfiguredModelId(configured: string | undefined, default
     swallow("pi: configured model id not in registry, falling back to default", new Error(candidate));
   }
   return DEFAULT_AGENT_MODEL_ID;
-}
-
-export function withRequestHeaders(model: Model<Api>, direct: boolean, fast: boolean, apiKey?: string): Model<Api> {
-  const api = String((model as { api?: unknown }).api ?? "").toLowerCase();
-  if (api.startsWith("openai") || !direct) return model;
-  const betas = [...(thinkingBindingApplies(model) ? [THINKING_BINDING_BETA] : []), ...(fast ? [FAST_MODE_BETA] : [])];
-  if (!betas.length) return model;
-  const prior = model.headers?.["anthropic-beta"];
-  const beta = [
-    ...new Set([
-      ...claudeSubscriptionBetas(apiKey),
-      ...(prior ? prior.split(",").map((value) => value.trim()) : []),
-      ...betas,
-    ]),
-  ].join(",");
-  return { ...model, headers: { ...model.headers, "anthropic-beta": beta } };
 }
 
 export function applyTurnEffort(session: AgentSession, level?: string): void {
@@ -1488,16 +919,7 @@ export function createAgent(opts?: AgentOptions): Agent {
     tools: ToolDefinition[],
     loadImage: ReplayImageLoader | undefined,
   ): Promise<{ entry: TurnSession }> {
-    let reconstructed: PiReplayMessage[] | null;
-    try {
-      reconstructed = await restoreReplayImages(reconstructMessagesFromHistory(history), loadImage);
-    } catch (err) {
-      console.error("[agent] history reconstruction failed; will fall back:", errMessage(err));
-      reconstructed = null;
-    }
-    const seedSource = reconstructed;
-    const seedPlan = planColdStartSeed(seedSource, !!priorTurns?.length);
-    const composedPrompt = systemPrompt + (seedPlan === "preamble" ? replayPreamble(history) : "");
+    const reconstructed = await restoreReplayImages(reconstructMessagesFromHistory(history), loadImage);
 
     const modelRuntime = await buildModelRuntime(
       turnProviderKeys ?? (await resolveProviderKeys()),
@@ -1506,7 +928,7 @@ export function createAgent(opts?: AgentOptions): Agent {
     );
     const { resourceLoader, settingsManager, cwd, agentDir, ephemeralCwd } = await createIsolatedResources(
       tempDirPrefix,
-      composedPrompt,
+      systemPrompt,
     );
 
     let session: AgentSession;
@@ -1527,15 +949,15 @@ export function createAgent(opts?: AgentOptions): Agent {
       throw err;
     }
 
-    if (seedPlan === "structured") {
+    if (reconstructed.length) {
       try {
-        seedRawMessagesIntoSession(session, seedSource!);
+        seedRawMessagesIntoSession(session, reconstructed);
       } catch (err) {
         console.error("[agent] failed to seed reconstructed history (continuing without it):", errMessage(err));
       }
-    } else if (seedPlan === "priorTurns") {
+    } else if (priorTurns?.length) {
       try {
-        seedRawMessagesIntoSession(session, seedPriorTurns(priorTurns!, []).map(toPiMessage));
+        seedRawMessagesIntoSession(session, seedPriorTurns(priorTurns, []).map(toPiMessage));
       } catch (err) {
         console.error("[agent] failed to seed prior turns (continuing without them):", errMessage(err));
       }
@@ -1591,7 +1013,7 @@ export function createAgent(opts?: AgentOptions): Agent {
     const entry: TurnSession = {
       agentSession: session,
       ref,
-      composedPromptTokens: countTokens(composedPrompt),
+      composedPromptTokens: countTokens(systemPrompt),
       cwd,
       agentDir,
       ...(ephemeralCwd ? { ephemeralCwd } : {}),
@@ -1891,9 +1313,14 @@ export function createAgent(opts?: AgentOptions): Agent {
           promptStart,
           turnWallClockMs,
         });
-        const rawRemainingCapMs = floorCap.remainingCapMs;
         const raceCapMs = floorCap.raceCapMs;
-        const extendCapMs = floorCap.extendMs;
+        const roomToReprompt = () => turnWallClockMs <= 0 || raceCapMs() >= EMPTY_ENDING_MIN_BUDGET_MS;
+        const reprompt = (note: string) =>
+          raceTurnWallClock(entry.agentSession.prompt(note), {
+            capMs: raceCapMs(),
+            extendMs: floorCap.extendMs,
+            abort: () => entry.agentSession.abort(),
+          });
         const refusedModelIds = new Set<string>();
         const attemptRefusalFallback = async (refusal: string): Promise<boolean> => {
           if (userAborted || turn.cancel?.aborted) return false;
@@ -1916,8 +1343,7 @@ export function createAgent(opts?: AgentOptions): Agent {
             refusedModelIds.has(servedModelId(fallbackId))
           )
             return false;
-          const capMs = raceCapMs();
-          if (turnWallClockMs > 0 && capMs < EMPTY_ENDING_MIN_BUDGET_MS) return false;
+          if (!roomToReprompt()) return false;
           console.error(
             `[pi] provider refusal — retrying on fallback model ${fromId} -> ${fallbackId} session=${turn.session.id}: ${refusal}`,
           );
@@ -1931,11 +1357,8 @@ export function createAgent(opts?: AgentOptions): Agent {
             custom?.effortLevel ?? turn.runtime?.effortLevel ?? defaultInteractiveThinkingLevel(fallback);
           applyTurnEffort(entry.agentSession, entry.ref.effortLevel);
           dropFailedAssistant(entry.agentSession, messagesBefore);
-          const outcome = await raceTurnWallClock(
-            entry.agentSession.prompt(
-              refusalFallbackNote(modelDisplayName(fromId!), modelDisplayName(fallbackId), refusal),
-            ),
-            { capMs, extendMs: extendCapMs, abort: () => entry.agentSession.abort() },
+          const outcome = await reprompt(
+            refusalFallbackNote(modelDisplayName(fromId!), modelDisplayName(fallbackId), refusal),
           );
           if (userAborted) return false;
           if (outcome !== "ok") throw new NonRetryableTurnError(refusal);
@@ -1961,15 +1384,10 @@ export function createAgent(opts?: AgentOptions): Agent {
             .slice(messagesBefore)
             .findLast((m) => (m as { role?: string }).role === "assistant") as AssistantMessage | undefined;
           if (lastAssistant && lastAssistant.stopReason !== "error") return false;
-          const capMs = raceCapMs();
-          if (turnWallClockMs > 0 && capMs < EMPTY_ENDING_MIN_BUDGET_MS) return false;
+          if (!roomToReprompt()) return false;
           documentRetried = true;
           dropFailedAssistant(entry.agentSession, messagesBefore);
-          const outcome = await raceTurnWallClock(entry.agentSession.prompt(DOCUMENTS_DROPPED_RETRY_NOTE), {
-            capMs,
-            extendMs: extendCapMs,
-            abort: () => entry.agentSession.abort(),
-          });
+          const outcome = await reprompt(DOCUMENTS_DROPPED_RETRY_NOTE);
           if (userAborted) return false;
           if (outcome !== "ok")
             throw new NonRetryableTurnError(
@@ -1977,16 +1395,16 @@ export function createAgent(opts?: AgentOptions): Agent {
             );
           return true;
         };
-        const recoverFailedRound = async (): Promise<void> => {
-          if (entry.ref.runtimeHandoff || userAborted || turn.cancel?.aborted) return;
-          await retryWithoutDocuments();
-          const refusal = providerRefusalError(entry.agentSession, messagesBefore);
-          if (!refusal) return;
+        const recoverFailedRound = async (thrown?: Error): Promise<boolean> => {
+          const retried = await retryWithoutDocuments();
+          const failure =
+            (retried ? null : thrown) ?? piAssistantFailure(messagesSince(entry.agentSession, messagesBefore));
+          if (!(failure instanceof ProviderTurnError && FALLBACK_CODES.has(failure.code))) return retried;
           try {
-            await attemptRefusalFallback(refusal);
+            return await attemptRefusalFallback(failure.message);
           } catch (e) {
             swallow("pi: refusal fallback", e);
-            throw new NonRetryableTurnError(refusal);
+            throw new NonRetryableTurnError(failure.message);
           }
         };
         try {
@@ -1999,18 +1417,16 @@ export function createAgent(opts?: AgentOptions): Agent {
               : entry.agentSession.prompt(modelPrompt, images ? { images } : undefined),
             {
               capMs: raceCapMs(),
-              extendMs: extendCapMs,
+              extendMs: floorCap.extendMs,
               abort: () => entry.agentSession.abort(),
             },
           );
-          if (wallClock === "ok") await recoverFailedRound();
+          if (wallClock === "ok" && !entry.ref.runtimeHandoff) await recoverFailedRound();
           const goalAfterPrompt = entry.ref.goal;
           if (wallClock === "ok" && goalAfterPrompt && !userAborted && !turn.cancel?.aborted) {
-            wallClock = await enforceGoal({
+            await enforceGoal({
               goal: goalAfterPrompt,
               meter: grindMeter,
-              outcome: wallClock,
-              ok: "ok" as const,
               blocked: () =>
                 userAborted ||
                 !!turn.cancel?.aborted ||
@@ -2030,21 +1446,14 @@ export function createAgent(opts?: AgentOptions): Agent {
                   }
                 : {}),
               ...(turn.goalInbox ? { inbox: turn.goalInbox } : {}),
-              beforePrompt: async () => {
+              prompt: async (note) => {
                 console.error(`[goal] continuation session=${turn.session.id} round=${(entry.ref.goalRound ?? 0) + 1}`);
                 entry.ref.goalRound = (entry.ref.goalRound ?? 0) + 1;
                 entry.ref.silentRequested = false;
                 await thinkTail;
-              },
-              prompt: async (note) => {
-                if (turnWallClockMs > 0 && rawRemainingCapMs() < EMPTY_ENDING_MIN_BUDGET_MS) return "aborted";
-                const outcome = await raceTurnWallClock(entry.agentSession.prompt(note), {
-                  capMs: raceCapMs(),
-                  extendMs: extendCapMs,
-                  abort: () => entry.agentSession.abort(),
-                });
-                if (outcome === "ok") await recoverFailedRound();
-                return outcome;
+                wallClock = roomToReprompt() ? await reprompt(note) : "aborted";
+                if (wallClock === "ok" && !entry.ref.runtimeHandoff) await recoverFailedRound();
+                return wallClock === "ok";
               },
             });
           }
@@ -2057,25 +1466,16 @@ export function createAgent(opts?: AgentOptions): Agent {
             ref: entry.ref,
             session: entry.agentSession,
             turnWallClockMs,
-            elapsedMs: turnWallClockMs > 0 ? turnWallClockMs - rawRemainingCapMs() : Date.now() - promptStart,
+            elapsedMs: turnWallClockMs > 0 ? turnWallClockMs - floorCap.remainingCapMs() : Date.now() - promptStart,
           });
           if (note) {
             console.error(
               `[pi] empty final response after ${entry.ref.modelCalls} model calls — re-prompting once session=${turn.session.id}`,
             );
             await thinkTail;
-            const capMs = raceCapMs();
-            if (
-              !userAborted &&
-              !turn.cancel?.aborted &&
-              (turnWallClockMs <= 0 || capMs >= EMPTY_ENDING_MIN_BUDGET_MS)
-            ) {
+            if (!userAborted && !turn.cancel?.aborted && roomToReprompt()) {
               try {
-                const outcome = await raceTurnWallClock(entry.agentSession.prompt(note), {
-                  capMs,
-                  extendMs: extendCapMs,
-                  abort: () => entry.agentSession.abort(),
-                });
+                const outcome = await reprompt(note);
                 if (outcome !== "ok" && !userAborted) {
                   recoveryDead = true;
                 } else if (
@@ -2097,19 +1497,7 @@ export function createAgent(opts?: AgentOptions): Agent {
             turn.cancel?.aborted === true && (err as { name?: string } | null)?.name === "AbortError";
           if (!userAborted && !cancelAbortRejection) {
             const turnErr = piTurnError(entry.agentSession, err, messagesBefore);
-            let recovered = false;
-            try {
-              recovered = await retryWithoutDocuments();
-            } catch (e) {
-              swallow("pi: document-free retry", e);
-            }
-            if (!recovered && turnErr instanceof ProviderTurnError && FALLBACK_CODES.has(turnErr.code)) {
-              try {
-                recovered = await attemptRefusalFallback(turnErr.message);
-              } catch (e) {
-                swallow("pi: refusal fallback", e);
-              }
-            }
+            const recovered = await recoverFailedRound(turnErr).catch(swallowAs("pi: failed-round recovery", false));
             if (!recovered && !userAborted) throw turnErr;
           }
           wallClock = "ok";
@@ -2144,20 +1532,27 @@ export function createAgent(opts?: AgentOptions): Agent {
               (wallClock === "abandoned" ? " (a stuck operation did not respond to cancellation)" : ""),
           );
         }
+        const settleGoal = async (pause: boolean): Promise<void> => {
+          const g = entry.ref.goal;
+          if (!g) return;
+          bankGoalTurn(g, grindMeter.startedAt);
+          if (pause && g.status === "active") {
+            g.status = "paused";
+            g.updatedAt = Date.now();
+          }
+          await turn.saveGoal?.(g);
+          if (g.status === "complete") entry.ref.goal = null;
+        };
+        const result = (reply: string, extra: Partial<AgentTurnResult>): AgentTurnResult => {
+          const cacheUsage = sumCacheUsage(callUsage);
+          return { reply, ...extra, modelCalls: entry.ref.modelCalls ?? 0, ...(cacheUsage ? { cacheUsage } : {}) };
+        };
         if (entry.ref.runtimeHandoff && !userAborted && !turn.cancel?.aborted) {
           steps.flush();
           await thinkTail;
           if (persistError) throw persistError;
-          if (entry.ref.goal) {
-            bankGoalTurn(entry.ref.goal, grindMeter.startedAt);
-            await turn.saveGoal?.(entry.ref.goal);
-          }
-          return {
-            reply: "",
-            runtimeHandoff: entry.ref.runtimeHandoff,
-            modelCalls: entry.ref.modelCalls ?? 0,
-            cacheUsage: sumCacheUsage(callUsage) ?? undefined,
-          };
+          await settleGoal(false);
+          return result("", { runtimeHandoff: entry.ref.runtimeHandoff });
         }
         const freshStopReason = freshAssistantStopReason();
         const cancelStoppedCleanly =
@@ -2171,38 +1566,17 @@ export function createAgent(opts?: AgentOptions): Agent {
             ? textFromContent((lastFreshAssistant as { content?: unknown }).content)
             : "";
           const reply = partial.trim() ? partial : "(stopped)";
-          if (entry.ref.goal) {
-            const g = entry.ref.goal;
-
-            bankGoalTurn(g, grindMeter.startedAt);
-            if (userAborted && g.status === "active") {
-              g.status = "paused";
-              g.updatedAt = Date.now();
-            }
-            await turn.saveGoal?.(g);
-            if (g.status === "complete") entry.ref.goal = null;
-          }
+          await settleGoal(userAborted);
           await recordStoppedTurn(
             turn,
             partial,
             userAborted ? abortReason : "because the run was cancelled",
             steps.closing(reply),
           );
-          const cacheUsage = sumCacheUsage(callUsage);
-          const base = {
-            reply,
-            stopped: true as const,
-            modelCalls: entry.ref.modelCalls ?? 0,
-          };
-          return cacheUsage ? { ...base, cacheUsage } : base;
+          return result(reply, { stopped: true });
         }
 
-        if (entry.ref.goal) {
-          const g = entry.ref.goal;
-          bankGoalTurn(g, grindMeter.startedAt);
-          await turn.saveGoal?.(g);
-          if (g.status === "complete") entry.ref.goal = null;
-        }
+        await settleGoal(false);
         const closingText = recoveryDead ? "" : (piLastAssistantTextOrThrow(entry.agentSession) ?? "");
         const reply = entry.ref.silentRequested ? "" : closingText;
         await turn.emit({
@@ -2211,19 +1585,11 @@ export function createAgent(opts?: AgentOptions): Agent {
           scopeLabel: turn.scopeLabel,
         });
         const pendingApprovals = entry.ref.pendingApprovals ?? [];
-        const modelCalls = entry.ref.modelCalls ?? 0;
-        const cacheUsage = sumCacheUsage(callUsage);
-        const silent = entry.ref.silentRequested ? { silent: true as const } : {};
-        const base = pendingApprovals.length
-          ? {
-              reply,
-              pendingApprovals,
-              ...(entry.ref.pausedOnApproval ? { pausedOnApproval: true as const } : {}),
-              modelCalls,
-              ...silent,
-            }
-          : { reply, modelCalls, ...silent };
-        return cacheUsage ? { ...base, cacheUsage } : base;
+        return result(reply, {
+          ...(pendingApprovals.length ? { pendingApprovals } : {}),
+          ...(pendingApprovals.length && entry.ref.pausedOnApproval ? { pausedOnApproval: true } : {}),
+          ...(entry.ref.silentRequested ? { silent: true } : {}),
+        });
       } finally {
         removeIsolatedDirs(entry);
       }
