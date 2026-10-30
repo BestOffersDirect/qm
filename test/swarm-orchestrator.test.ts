@@ -2,11 +2,11 @@ import "./support/auto-fake-sprites.ts";
 import { mock, test } from "node:test";
 import assert from "node:assert/strict";
 import * as modalClient from "../src/sandbox/modal-client.ts";
-import * as mockHarness from "./support/mock-harness.ts";
+import * as mockAgent from "./support/mock-agent.ts";
 import { installFakeModal } from "./support/fake-modal.ts";
 import { testConfig } from "./support/test-config.ts";
 import { runResultDelivery } from "../src/delivery/run-result-delivery.ts";
-import type { HarnessTurnInput } from "../src/harness/harness.ts";
+import type { AgentTurnInput } from "../src/agent/agent.ts";
 import { createServer } from "../src/api/server.ts";
 import { signedRequestHeaders } from "../plugins/chassis/src/source-auth-sign.ts";
 import { mintPortalIdentity } from "../src/auth/portal-identity.ts";
@@ -17,24 +17,24 @@ import type { AddressInfo } from "node:net";
 import type { TurnRequest } from "../src/types.ts";
 
 const screenedPayloads: string[] = [];
-let exerciseTurn: ((turn: HarnessTurnInput) => Promise<void | { stopped: true }>) | undefined;
+let exerciseTurn: ((turn: AgentTurnInput) => Promise<void | { stopped: true }>) | undefined;
 
 const fake = installFakeModal();
 mock.module("../src/sandbox/modal-client.ts", {
   namedExports: { ...modalClient, createSdkModalClient: () => fake.client },
 });
-mock.module("./support/mock-harness.ts", {
+mock.module("./support/mock-agent.ts", {
   namedExports: {
-    ...mockHarness,
-    createMockHarness: () => {
-      const harness = mockHarness.createMockHarness();
-      const screen = harness.models.screenSecurity!;
-      harness.models.screenSecurity = async (input) => {
+    ...mockAgent,
+    createMockAgent: () => {
+      const agent = mockAgent.createMockAgent();
+      const screen = agent.screenSecurity!;
+      agent.screenSecurity = async (input) => {
         screenedPayloads.push(input.payload);
         return screen(input);
       };
-      const runTurn = harness.turns.runTurn;
-      harness.turns.runTurn = async (turn) => {
+      const runTurn = agent.runTurn;
+      agent.runTurn = async (turn) => {
         const outcome = await exerciseTurn?.(turn);
         if (outcome?.stopped || turn.cancel?.aborted) return { reply: "", stopped: true };
         return runTurn(
@@ -43,7 +43,7 @@ mock.module("./support/mock-harness.ts", {
             : turn,
         );
       };
-      return harness;
+      return agent;
     },
   },
 });
@@ -486,7 +486,7 @@ test("a resolved command approval informs the model without changing its request
     conversation: { kind: "dm", threadRef: "web:U1:approval-hint" },
     text: "!run printf approval-isolation",
   };
-  const turns: HarnessTurnInput[] = [];
+  const turns: AgentTurnInput[] = [];
   exerciseTurn = async (turn) => {
     turns.push(turn);
   };
@@ -624,11 +624,9 @@ test("a goal assigned at spawn becomes the worker's session goal and its turn ha
     });
     await built.app.swarms!.sweep();
     const worker = (await built.runs.list()).find((run) => run.request.swarm)!;
-    const seen: Array<Pick<HarnessTurnInput, "goal" | "turnWallClockMs" | "goalContinuation">> = [];
+    const seen: Array<Pick<AgentTurnInput, "goal" | "turnWallClockMs">> = [];
     exerciseTurn = async (turn) => {
-      if (!turn.input.startsWith("Swarm ") && !turn.goalContinuation) return;
-      seen.push({ goal: turn.goal, turnWallClockMs: turn.turnWallClockMs, goalContinuation: turn.goalContinuation });
-      if (turn.goalContinuation) return { stopped: true };
+      if (turn.input.startsWith("Swarm ")) seen.push({ goal: turn.goal, turnWallClockMs: turn.turnWallClockMs });
     };
     built.runtime.start();
     const completed = await built.runs.waitFor(worker.id, 15_000);
@@ -636,10 +634,6 @@ test("a goal assigned at spawn becomes the worker's session goal and its turn ha
     assert.equal(seen[0]?.goal?.objective, "Exhaust the lane");
     assert.equal(seen[0]?.goal?.capTokens, 50_000);
     assert.equal(seen[0]?.turnWallClockMs, 0);
-    assert.ok(
-      seen.some((turn) => turn.goalContinuation),
-      "the goal kept the worker going after its first reply",
-    );
     const goals = await built.sessions.goals([completed.result!.sessionId!]);
     assert.equal(goals.get(completed.result!.sessionId!)?.objective, "Exhaust the lane");
   } finally {
@@ -674,7 +668,6 @@ test("a worker with an open goal answers messages as a goal turn without the swa
     const first = (await built.runs.list()).find((run) => run.request.swarm)!;
     const seen: Array<{ deadline?: number; inbox: boolean }> = [];
     exerciseTurn = async (turn) => {
-      if (turn.goalContinuation) return { stopped: true };
       if (turn.input.startsWith("Swarm ")) seen.push({ deadline: turn.turnWallClockMs, inbox: !!turn.goalInbox });
     };
     built.runtime.start();
@@ -692,78 +685,6 @@ test("a worker with an open goal answers messages as a goal turn without the swa
     await built.runtime.stop();
   }
 });
-
-for (const stopped of [false, true])
-  test(`a replacement goal sent to a busy worker takes over its running goal turn (turn ${stopped ? "stopped" : "finishes"})`, async () => {
-    const built = buildApp(testConfig({ modalSandbox: { tokenId: "test", tokenSecret: "test" } }));
-    try {
-      const rootComputer = await built.sandboxResources.create("U1", "personal:U1", "sprites", "Root");
-      await built.sandboxResources.setDefault("U1", "personal:U1", rootComputer.id);
-      const rootTurn = await built.app.turn({
-        surface: "test",
-        actor: { externalId: "U1" },
-        conversation: { kind: "dm", threadRef: `swarm-goal-replace-root-${stopped}` },
-        origin: { kind: "human" },
-        text: "Coordinate work",
-      });
-      const root = (await built.sessions.get(rootTurn.sessionId!))!;
-      const rootRun = (await built.runs.list()).find((run) => run.request.conversation.threadRef === root.threadRef)!;
-      const caller = { kind: "human" as const, actorId: "U1", sessionId: root.id, runId: rootRun.id };
-      const [member] = await built.app.swarms!.spawn(caller, {
-        requestId: "replace-worker",
-        text: "Work lane A",
-        goal: { objective: "Exhaust lane A", floor: { minMs: 3_600_000 } },
-      });
-      await built.app.swarms!.sweep();
-      const worker = (await built.runs.list()).find((run) => run.request.swarm)!;
-      const seen: Array<{ objective?: string; input: string }> = [];
-      let replacement: { id: string } | undefined;
-      let heldUntilTurnEnd = false;
-      exerciseTurn = async (turn) => {
-        if (!turn.input.startsWith("Swarm ") && !turn.goalContinuation) return;
-        seen.push({ objective: turn.goal?.objective, input: turn.input });
-        if (!replacement) {
-          replacement = await built.app.swarms!.send(caller, {
-            requestId: "replace-goal",
-            audience: [member!.id],
-            text: "Drop lane A and take lane B",
-            goal: { objective: "Exhaust lane B" },
-          });
-          await built.app.swarms!.sweep();
-          assert.ok((await built.runs.list()).some((run) => run.request.swarm?.messageId === replacement!.id));
-          return;
-        }
-        if (turn.goal?.objective === "Exhaust lane B") {
-          const queued = await built.app.swarms!.queuedMessages(worker.request);
-          heldUntilTurnEnd = queued.some((message) => message.id === replacement!.id);
-          if (stopped) return { stopped: true };
-          turn.goal!.status = "complete";
-          return;
-        }
-      };
-      built.runtime.start();
-      const completed = await built.runs.waitFor(worker.id, 15_000);
-      assert.equal(completed.status, "done", JSON.stringify(completed.result));
-      const handed = seen.find((turn) => turn.input.includes("Drop lane A and take lane B"));
-      assert.ok(handed, JSON.stringify(seen));
-      assert.equal(handed.objective, "Exhaust lane B");
-      assert.match(handed.input, /assigns you a new goal[\s\S]*Exhaust lane B/);
-      assert.ok(heldUntilTurnEnd, "a shown message stays queued until the turn that showed it has finished");
-      const state = (await built.app.swarms!.read(caller, { after: 0 })).find(
-        (message) => message.id === replacement!.id,
-      )?.notifications[member!.id]?.state;
-      if (stopped) assert.notEqual(state, "handed", "a stopped turn leaves what it showed queued");
-      else {
-        assert.equal(state, "handed");
-        assert.ok(!(await built.runs.list()).some((run) => run.request.swarm?.messageId === replacement!.id));
-      }
-      const goals = await built.sessions.goals([completed.result!.sessionId!]);
-      assert.equal(goals.get(completed.result!.sessionId!)?.objective, "Exhaust lane B");
-    } finally {
-      exerciseTurn = undefined;
-      await built.runtime.stop();
-    }
-  });
 
 test("a worker's reply waits in the root's mailbox and reaches the root's next human turn once", async () => {
   const built = buildApp(testConfig({ modalSandbox: { tokenId: "test", tokenSecret: "test" } }));

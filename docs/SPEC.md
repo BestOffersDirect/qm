@@ -14,7 +14,7 @@
 
 **Agent turns.** The system revolves around durable execution against a central writeahead log: the session tape. To execute an agent turn, a session offers up a write lease, at which point a worker claims it from the run queue. The _orchestrator_ assembles context and drives a harness, which fulfills tool calls, and the result is committed to the session tape. The system should be robust to interruption at any time, end to end, and scale to swarms that are millions of agents strong.
 
-**Swappable harnesses and models.** Agents have a single tool catalog; their turns can be fulfilled by Pi or Claude Code, which call into the model catalog, the canonical source for model varieties, effort levels, speed multipliers, and their prices. A particular selection of those variables fulfilling a turn is called the _runtime_.
+**Models.** Agents have a single tool catalog; their turns are fulfilled by Pi, which calls into the model catalog, the canonical source for model varieties, effort levels, speed multipliers, and their prices. A particular selection of those variables fulfilling a turn is called the _runtime_.
 
 **Scopes.** The original model was one OpenClaw per-person or per-channel. That means isolated compute, memory, files, crons, and apps. Breaking through that isolation requires an explicit and auditable _grant_.
 
@@ -164,7 +164,7 @@ Publishing organization-specific information in the public repository through co
 
 Replacing or swallowing a failure so the evidence needed to diagnose it disappears.
 
-- **Sandbox startup and cleanup** (2026-10-02): A provider authentication failure reached the tool transcript as a bare "Command execution failed." The cleanup wrappers in `src/sandbox/sandbox.ts` dropped the original causes, destruction retries in `src/core/orchestrator/sandboxes.ts` swallowed every exception, and `src/harness/agent-tools.ts` recorded only the generic status. _Status:_ wound back in [qm#2018](https://github.com/yc-software/qm/pull/2018).
+- **Sandbox startup and cleanup** (2026-10-02): A provider authentication failure reached the tool transcript as a bare "Command execution failed." The cleanup wrappers in `src/sandbox/sandbox.ts` dropped the original causes, destruction retries in `src/core/orchestrator/sandboxes.ts` swallowed every exception, and `src/agent/agent-tools.ts` recorded only the generic status. _Status:_ wound back in [qm#2018](https://github.com/yc-software/qm/pull/2018).
 - **Rejected session titles:** `sanitizeTitle` returned `undefined` for rejected model output. The fallback title made the request look successful, while neither the rejected text nor the rule that rejected it reached the error log. _Status:_ [qm#1303](https://github.com/yc-software/qm/pull/1303) records the rejection rule and a bounded sample in the durable error log.
 - **Failed transaction rollback:** `withPgTransaction` and copied transaction handlers awaited `ROLLBACK` before rethrowing the original error. If rollback also failed, its exception replaced the actual transaction failure. _Status:_ still present on main; [qm#1834](https://github.com/yc-software/qm/pull/1834) proposes preserving the original error and discarding the broken connection.
 

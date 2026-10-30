@@ -99,7 +99,6 @@ export interface SpawnMeta {
   timezone?: string;
   readOnly?: boolean;
   model?: string;
-  harness?: string;
   thinkingLevel?: string;
   fastMode?: boolean;
 }
@@ -281,7 +280,7 @@ export interface CronFireNote {
 }
 
 export interface Cron extends TriggerBase {
-  runtime?: import("./harness/harness.ts").RuntimeChoice | null;
+  runtime?: import("./agent/agent.ts").RuntimeChoice | null;
   schedule: CronSchedule;
   nextFireAt?: number;
   lastAttemptAt?: number;
@@ -719,7 +718,6 @@ export interface TurnRequest {
   attachments?: IncomingAttachment[];
   inboundNotes?: string[];
   model?: string;
-  harness?: string;
   thinkingLevel?: string;
   fastMode?: boolean;
   readOnly?: boolean;
@@ -797,7 +795,6 @@ export interface CommandApprovalGrant {
 }
 
 export interface TurnRuntime {
-  harnessId: string;
   modelId: string;
   label?: string;
   change?: { rule: string } | { agent: "task" | "scope" };

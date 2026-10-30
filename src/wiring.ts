@@ -45,7 +45,7 @@ import { createGmailPushClient } from "./loops/gmail-push.ts";
 import { createGatewayCatalog } from "./model/gateway-catalog.ts";
 import { createSuggestedActivityService, type SuggestedActivityProfile } from "./suggestions/activities.ts";
 import { createMemoryTidyService, withMemoryTidy, type MemoryTidyProfile } from "./memory/tidy.ts";
-import { createRuntimeService } from "./harness/runtime-control.ts";
+import { createRuntimeService } from "./agent/runtime-control.ts";
 import {
   createSessionSyscalls,
   type SessionSyscallsFactory,
@@ -68,7 +68,7 @@ import {
   type SandboxResources,
 } from "./sandbox/sandbox-resources.ts";
 import { createModelVerifier, type ModelVerifier } from "./model/model-verification.ts";
-import type { probeModel } from "./harness/pi-harness.ts";
+import type { probeModel } from "./agent/agent-run.ts";
 import { createAwsRoleBroker, type AwsRoleBroker } from "./auth/aws-role-broker.ts";
 import type { SessionShare, SessionShareStore } from "./sessions/session-share.ts";
 import { createModelOverlayStore, type ModelOverlayStore } from "./model/model-overlay-store.ts";
@@ -78,9 +78,9 @@ import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { join, resolve } from "node:path";
 import {
   baseModelProviders,
-  configuredModelForHarness,
+  companySubscriptionAuth,
+  configuredModel,
   enabledSandboxBackends,
-  harnessCarriedModelAuth,
   providerKeysPresent,
   type Config,
 } from "./config.ts";
@@ -147,7 +147,6 @@ import type { SecurityScreenProbe } from "./security/security-screener.ts";
 import { createPostgresBudgetTracker } from "./ratelimit/postgres-budget.ts";
 import { createCronStore, DROP_RUN_AS_MIGRATION, type CronStore } from "./cron/cron-store.ts";
 import { DROP_RECIPIENT_CONSENT_MIGRATION } from "./triggers/trigger-store.ts";
-import { LEGACY_HARNESS_MIGRATION } from "./model/legacy-harness-migration.ts";
 import { createMemoryCronFireStore, createPostgresCronFireStore } from "./cron/fire-store.ts";
 import { createLoopStore } from "./loops/loop-store.ts";
 import { createLoopItemLedger } from "./loops/item-ledger.ts";
@@ -320,12 +319,11 @@ import {
   keychainCompanyChatGPTAuth,
   type CompanyChatGPTAuth,
 } from "./model/company-chatgpt-auth.ts";
-import { keychainHarnessAuthEnv } from "./credentials/harness-auth-env.ts";
-import { createClaudeHarness, claudeHarnessConfigOptions } from "./harness/claude-harness.ts";
-import { createPiHarness, piHarnessConfigOptions, type ProviderKeys } from "./harness/pi-harness.ts";
-import { createHarnessRouter, resolveRuntimeChoiceDurable } from "./harness/harness-router.ts";
+import { keychainEnvCredential } from "./credentials/keychain-env-credential.ts";
+import { createAgent, agentConfigOptions, type ProviderKeys } from "./agent/agent-run.ts";
+import { withResolvedRuntime, resolveRuntimeChoiceDurable } from "./agent/runtime-choice.ts";
 import { selectableModelCatalog } from "./model/model-catalog.ts";
-import type { Harness } from "./harness/harness.ts";
+import type { Agent } from "./agent/agent.ts";
 import { createSecurityScreenProxy, type SecurityScreener } from "./security/security-screener.ts";
 import { createMemoryStrategy } from "./memory/strategy.ts";
 import { createOrchestrator, egressClaimAllowingControlPlane, type OrchestratorDeps } from "./core/orchestrator.ts";
@@ -403,11 +401,9 @@ import {
   isOverlayModel,
   modelRequestOverrides,
   auxiliaryModelForProvider,
-  defaultModelForHarness,
-  modelProviderAvailabilityFor,
+  defaultModel,
   resolveModel,
-  type HarnessId,
-  modelSupportedByHarness,
+  modelSupported,
 } from "./model/pi-models.ts";
 import { createAdminService, bootAdminGrantSeed, type AdminService } from "./admin/admin-service.ts";
 import { createAdminGrantStore, createMapAdminGrantPersistence, type AdminGrant } from "./admin/admin-grant-store.ts";
@@ -581,7 +577,7 @@ export function buildApp(
     credentialBrokers?: Record<string, AwsRoleBroker>;
     modelCredentialFetch?: typeof fetch;
     modelVerificationProbe?: typeof probeModel;
-    harnesses?: Partial<Record<HarnessId, Harness>>;
+    agent?: Agent;
   } = {},
 ): BuiltApp {
   let backgroundAdmission = () => !config.backgroundDeploymentId;
@@ -657,6 +653,7 @@ export function buildApp(
       return {
         ...direct,
         ...(directProviderAvailability.codexOAuth ? { codexOAuth: true } : {}),
+        ...(config.claudeAuthCredential ? { anthropic: true } : {}),
         modelIds: new Set(Object.keys(gatewayTransport?.models ?? {})),
       };
     },
@@ -1454,12 +1451,33 @@ export function buildApp(
       return {};
     }
   };
-  const resolvePiProviderKeys = async (): Promise<ProviderKeys> => ({
-    ...(await resolveModelProviderKeys()),
-    ...(await resolveCompanySubscriptionKeys()),
-  });
+  const companyClaudeAuthEnv =
+    config.claudeAuthCredential && keychain
+      ? keychainEnvCredential(keychain, config.claudeAuthCredential, [
+          "CLAUDE_CODE_OAUTH_TOKEN",
+          "ANTHROPIC_AUTH_TOKEN",
+        ])
+      : undefined;
+  const resolveCompanyClaudeKeys = async (): Promise<ProviderKeys> => {
+    if (!companyClaudeAuthEnv) return {};
+    const env = await companyClaudeAuthEnv();
+    const token = env.CLAUDE_CODE_OAUTH_TOKEN || env.ANTHROPIC_AUTH_TOKEN;
+    if (!token)
+      console.error(
+        `[model] company Claude subscription credential ${config.claudeAuthCredential} yielded no token (missing, expired, or not an env credential)`,
+      );
+    return token ? { anthropic: token } : {};
+  };
+  const resolveCompanyProviderKeys = async (): Promise<ProviderKeys> => {
+    const [claude, metered, chatgpt] = await Promise.all([
+      resolveCompanyClaudeKeys(),
+      resolveModelProviderKeys(),
+      resolveCompanySubscriptionKeys(),
+    ]);
+    return { ...claude, ...metered, ...chatgpt };
+  };
   const resolveBrowserCompanyKeys = async (includeSubscription = true): Promise<ProviderKeys> =>
-    includeSubscription ? resolvePiProviderKeys() : resolveModelProviderKeys();
+    includeSubscription ? resolveCompanyProviderKeys() : resolveModelProviderKeys();
   const companyModelId = (id: string): string => {
     if (resolveModel(id)?.provider !== "openai" || isOverlayModel(id) || modelRequestOverrides(id)) return id;
     const subscription = codexSubscriptionModelId(id);
@@ -1468,51 +1486,28 @@ export function buildApp(
   const runtimeOrgScope = scopeId("org", config.orgId);
   const orgBaseModelId = (): string | undefined =>
     configStore.getRuntimeSelection(runtimeOrgScope)?.modelId ?? configStore.getBaseModel(runtimeOrgScope) ?? undefined;
-  const defaultForHarness = (harness: string) =>
-    defaultModelForHarness(
-      harness,
-      configuredModelForHarness(config, harness),
+  const deploymentDefaultModel = () =>
+    defaultModel(
+      configuredModel(config),
       baseModelProviders(config) ??
-        (harness === "pi" && gatewayTransport
+        (gatewayTransport
           ? { ...directProviderAvailability, modelIds: new Set(Object.keys(gatewayTransport.models)) }
           : undefined),
     );
-  const adapters = new Map<HarnessId, Harness>([
-    [
-      "pi",
-      overrides.harnesses?.pi ??
-        createPiHarness({
-          ...piHarnessConfigOptions(config),
-          modelGateway: gatewayTransport,
-          resolveBaseModelId: () => orgBaseModelId() ?? defaultForHarness("pi"),
-          resolveFallbackRuntime: () => configStore.getPurposeRuntime("fallback"),
-          resolveProviderKeys: resolvePiProviderKeys,
-          ...(directProviderAvailability.codexOAuth ? { companyModelId } : {}),
-          signals: runSignals,
-        }),
-    ],
-    [
-      "claude",
-      overrides.harnesses?.claude ??
-        createClaudeHarness({
-          ...claudeHarnessConfigOptions(config),
-          ...(config.claudeAuthCredential && keychain
-            ? {
-                authEnv: keychainHarnessAuthEnv(keychain, config.claudeAuthCredential, [
-                  "CLAUDE_CODE_OAUTH_TOKEN",
-                  "ANTHROPIC_AUTH_TOKEN",
-                ]),
-              }
-            : {}),
-          signals: runSignals,
-        }),
-    ],
-  ]);
-  const fallbackHarness = config.harness as HarnessId;
+  const baseAgent =
+    overrides.agent ??
+    createAgent({
+      ...agentConfigOptions(config),
+      modelGateway: gatewayTransport,
+      resolveBaseModelId: () => orgBaseModelId() ?? deploymentDefaultModel(),
+      resolveFallbackRuntime: () => configStore.getPurposeRuntime("fallback"),
+      resolveProviderKeys: resolveCompanyProviderKeys,
+      ...(directProviderAvailability.codexOAuth ? { companyModelId } : {}),
+      signals: runSignals,
+    });
   const fallback = {
-    harnessId: fallbackHarness,
     get modelId() {
-      return defaultForHarness(fallbackHarness);
+      return deploymentDefaultModel();
     },
   };
   const decide = createDecisionHooks(
@@ -1544,7 +1539,7 @@ export function buildApp(
     if (!(await modelCredentials.availability()).openrouter) return undefined;
     return selectableModelCatalog(overrides.modelCredentialFetch);
   };
-  const harness = createHarnessRouter(adapters, adapters.get(fallbackHarness)!, async (input, routedBy) => {
+  const agent = withResolvedRuntime(baseAgent, async (input, routedBy) => {
     const resolve = (requested: typeof input.runtime) =>
       resolveRuntimeChoiceDurable(
         configStore,
@@ -1565,10 +1560,9 @@ export function buildApp(
       }),
     );
     const routed = await routeTurnRuntime(decision, resolve, async () => {
-      if (input.runtimePinned && input.runtime?.harnessId && input.runtime.modelId) {
-        if (!modelSupportedByHarness(input.runtime.modelId, input.runtime.harnessId))
-          throw new Error(`Unsupported model: ${input.runtime.modelId}`);
-        return { ...input.runtime, harnessId: input.runtime.harnessId, modelId: input.runtime.modelId };
+      if (input.runtimePinned && input.runtime?.modelId) {
+        if (!modelSupported(input.runtime.modelId)) throw new Error(`Unsupported model: ${input.runtime.modelId}`);
+        return { ...input.runtime, modelId: input.runtime.modelId };
       }
       return resolve(input.runtime);
     });
@@ -1577,7 +1571,7 @@ export function buildApp(
   });
 
   if (config.securityScreen === "off" || config.securityScreenClassifier !== "model") {
-    delete harness.models.screenSecurity;
+    delete agent.screenSecurity;
   }
 
   const leaseTtlMs = config.leaseTtlMs;
@@ -1863,7 +1857,7 @@ export function buildApp(
   });
   const admin = createAdminService(adminGrantStore, { trustedOidcAdminIssuer: config.trustedOidcAdminIssuer });
   const { strategy: memoryStrategy, memory } = createMemoryStrategy(config.memoryStrategy, {
-    harness: harness.models,
+    agent,
     memory: baseMemory,
     captureQuietMs: config.memoryCaptureQuietMs,
     ...(config.memoryCaptureMaxTurns !== undefined ? { captureMaxTurns: config.memoryCaptureMaxTurns } : {}),
@@ -2030,7 +2024,17 @@ export function buildApp(
       "DELETE FROM durable_map_versions WHERE tbl = 'internal_member_overrides'",
     ],
   });
-  pgArtifactMap?.pool.registerMigration(LEGACY_HARNESS_MIGRATION);
+  pgArtifactMap?.pool.registerMigration({
+    id: "runtime/0002-drop-harness-choice",
+    statements: [
+      "DROP TABLE IF EXISTS approved_harness_configs",
+      "DELETE FROM durable_map_versions WHERE tbl = 'approved_harness_configs'",
+      `DO $$ BEGIN IF to_regclass('base_model_configs') IS NOT NULL THEN UPDATE base_model_configs SET json = (CASE WHEN json ? 'harnessId' AND NOT json ? 'orgRevision' THEN json || '{"orgRevision":0}'::jsonb ELSE json END) - 'harnessId' #- '{cronRuntime,harnessId}' #- '{subagentRuntime,harnessId}' #- '{fallbackRuntime,harnessId}' WHERE json ? 'harnessId' OR (json -> 'cronRuntime') ? 'harnessId' OR (json -> 'subagentRuntime') ? 'harnessId' OR (json -> 'fallbackRuntime') ? 'harnessId'; END IF; END $$`,
+      `DO $$ BEGIN IF to_regclass('auto_flagger_configs') IS NOT NULL THEN UPDATE auto_flagger_configs SET json = json - 'harnessId' WHERE json ? 'harnessId'; END IF; END $$`,
+      `DO $$ BEGIN IF to_regclass('crons') IS NOT NULL THEN UPDATE crons SET json = json #- '{runtime,harnessId}' WHERE (json -> 'runtime') ? 'harnessId'; END IF; END $$`,
+      `DO $$ BEGIN IF to_regclass('swarms') IS NOT NULL THEN UPDATE swarms SET json = json #- '{template,harness}' WHERE (json -> 'template') ? 'harness'; END IF; END $$`,
+    ],
+  });
   pgArtifactMap?.pool.registerMigration({
     id: "durable-map/suggested_activity_profiles/0001-nightly-on-use",
     statements: [
@@ -2103,7 +2107,6 @@ export function buildApp(
   };
   const runtimeDeps: RuntimeDeps = {
     config: configStore,
-    harnessId: fallbackHarness,
     get baseModelDefault() {
       return fallback.modelId;
     },
@@ -2132,7 +2135,6 @@ export function buildApp(
     },
     async validateRuntime(input, scope) {
       const requested = {
-        ...(input.harness ? { harnessId: input.harness as HarnessId } : {}),
         ...(input.model ? { modelId: input.model } : {}),
         ...(input.thinkingLevel ? { effortLevel: input.thinkingLevel } : {}),
         ...(typeof input.fastMode === "boolean" ? { fastMode: input.fastMode } : {}),
@@ -2176,7 +2178,6 @@ export function buildApp(
     identity,
     resolution,
     config: configStore,
-    defaultHarness: fallbackHarness,
     defaultTurnWallClockMs: config.turnWallClockMs,
     userModelCredentials,
     ...(config.brandingDefault ? { brandingDefault: config.brandingDefault } : {}),
@@ -2192,7 +2193,7 @@ export function buildApp(
     auditLog,
     rateLimiter,
     budget,
-    harness,
+    agent,
     memory,
     deploy: deployService,
     acl,
@@ -2348,11 +2349,10 @@ export function buildApp(
     ? createPostgresAckEmojiPickStore(config.databaseUrl)
     : createMemoryAckEmojiPickStore();
   const providerKeys = directProviderAvailability;
-  const screenSecurity: SecurityScreenProbe | undefined = harness.models.screenSecurity
-    ? ({ payload, harnessId, modelId, systemPrompt, actorId, scopeLabel, signal }) =>
-        harness.models.screenSecurity!({
+  const screenSecurity: SecurityScreenProbe | undefined = agent.screenSecurity
+    ? ({ payload, modelId, systemPrompt, actorId, scopeLabel, signal }) =>
+        agent.screenSecurity!({
           payload,
-          harnessId,
           modelId,
           systemPrompt,
           signal,
@@ -2430,18 +2430,17 @@ export function buildApp(
     reaperPoke: pokeReaper,
     surfaceCache,
     channelPolicy,
-    ...(harness.models.judge
-      ? { ambientJudge: (s: string, pr: string, signal?: AbortSignal) => harness.models.judge!(s, pr, signal) }
+    ...(agent.judge
+      ? { ambientJudge: (s: string, pr: string, signal?: AbortSignal) => agent.judge!(s, pr, signal) }
       : {}),
     ...(screenSecurity ? { screenSecurity } : {}),
     ambientCursors: artifactMap<{ lastJudgedTs: string; lastJudgedAt?: number }>("ambient_cursors"),
     ambientJudgments,
     ackEmojiPicks,
     judgeModelId,
-    harnessId: config.harness,
     runtimeFallback: fallback,
     providerKeys,
-    modelProviders: modelProviderAvailabilityFor(config.harness, providerKeys),
+    modelProviders: providerKeys,
     runWaitMs: config.runWaitMs,
   });
   const inboxRealtime = createInboxRealtime({
@@ -2483,7 +2482,7 @@ export function buildApp(
     ackPicks: ackEmojiPicks,
     ackModelId: () => auxiliaryModelForProvider("anthropic"),
     ...(config.brandingDefault ? { brandingDefault: config.brandingDefault } : {}),
-    ...(harness.models.pickAckEmoji ? { pickAckEmoji: (t, c) => harness.models.pickAckEmoji!(t, c) } : {}),
+    ...(agent.pickAckEmoji ? { pickAckEmoji: (t, c) => agent.pickAckEmoji!(t, c) } : {}),
   });
   runs.onTerminal((run) => {
     void runs
@@ -3070,7 +3069,7 @@ export function buildApp(
           runStreamEvents.close?.(),
         ].map((closing) => closing?.catch(reportFailureAs("shutdown: close event stores", undefined))),
       );
-      await harness.turns.close?.();
+      await agent.close?.();
       await semanticMemory.close();
       await flyTunnel?.stop();
       await errors.flush();
@@ -3191,8 +3190,8 @@ export function serverDeps(
   slackEnvironmentState: "absent" | "configured" | "partial" = "absent",
   slackEnvBotToken?: string,
 ): Omit<ServerDeps, "control"> {
-  const configuredModel = configuredModelForHarness(config, config.harness);
-  const carriedModelAuth = harnessCarriedModelAuth(config);
+  const deploymentModel = configuredModel(config);
+  const subscriptionAuth = companySubscriptionAuth(config);
   return {
     externalSlackPolicies: config.externalSlackPolicies,
     modelGatewayTransport: built.modelGatewayTransport,
@@ -3217,8 +3216,8 @@ export function serverDeps(
     ...(built.brokerSessions ? { brokerSessions: built.brokerSessions } : {}),
     config: built.config,
     ...(built.screenSecurity ? { screenSecurity: built.screenSecurity } : {}),
-    ...(configuredModel ? { baseModelDefault: configuredModel } : {}),
-    modelProviders: modelProviderAvailabilityFor(config.harness, providerKeysPresent(config)),
+    ...(deploymentModel ? { baseModelDefault: deploymentModel } : {}),
+    modelProviders: providerKeysPresent(config),
     providerKeys: providerKeysPresent(config),
     modelCredentials: built.modelCredentials,
     userModelCredentials: built.userModelCredentials,
@@ -3230,8 +3229,7 @@ export function serverDeps(
     mcpServers: built.mcpServers,
     mcpToolService: built.mcpToolService,
     ...(config.brandingDefault ? { brandingDefault: config.brandingDefault } : {}),
-    ...(carriedModelAuth ? { harnessCarriedModelAuth: carriedModelAuth } : {}),
-    harnessId: config.harness,
+    ...(subscriptionAuth ? { companySubscriptionAuth: subscriptionAuth } : {}),
     connectorTokens: built.connectorTokens,
     slackInstallation: built.slackInstallation,
     slackEnvironmentState,

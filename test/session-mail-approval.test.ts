@@ -17,7 +17,7 @@ import { createMemoryService } from "../src/memory/memory-service.ts";
 import { createModelGateway } from "../src/model/model-gateway.ts";
 import { createAuditLog } from "../src/audit/audit-log.ts";
 import { createRateLimiter } from "../src/ratelimit/rate-limiter.ts";
-import { defineHarness } from "../src/harness/harness.ts";
+import type { Agent } from "../src/agent/agent.ts";
 import { createDeployStore } from "../src/deploy/deploy-store.ts";
 import { createDockerDeployProvider } from "../src/deploy/docker-deploy-provider.ts";
 import { createDeployService } from "../src/deploy/deploy-service.ts";
@@ -25,7 +25,7 @@ import { createDeliveryStore } from "../src/delivery/delivery-store.ts";
 import { scopeId, type Conversation, type Principal } from "../src/types.ts";
 import type { Sandbox } from "../src/sandbox/sandbox.ts";
 
-import { createAgentTools } from "../src/harness/agent-tools.ts";
+import { createAgentTools } from "../src/agent/agent-tools.ts";
 import { createMemoryMap } from "../src/persistence/durable-map.ts";
 import { createFeatureFlagStore } from "../src/feature-flags.ts";
 import { createSessionMailbox, type SessionMessage } from "../src/sessions/session-mailbox.ts";
@@ -70,36 +70,27 @@ async function scenario() {
     signals: createMemoryRunSignalStore(),
     maxAttempts: 3,
   });
-  const harness = defineHarness(
-    {
-      id: "pi",
-      controlTransport: "in-process",
-      toolTransport: "in-process",
-      transcriptFormat: "pi",
-      capabilities: new Set(),
+  const agent: Agent = {
+    async runTurn(turn) {
+      await turn.emit({ type: "user", payload: { text: turn.input }, scopeLabel: turn.scopeLabel });
+      const ref = {
+        current: turn.tools,
+        scopeLabel: turn.scopeLabel,
+        emit: turn.emit,
+        screenToolResult: turn.screenToolResult,
+        pendingApprovals: [],
+      };
+      const tool = createAgentTools(ref).find((tool) => tool.name === "subagents")!;
+      const execute = tool.execute as unknown as (id: string, input: unknown) => Promise<{ content: unknown[] }>;
+      const result = await execute(`wait-call-${++callSeq}`, { action: "wait", timeoutMs: 0 });
+      const reply = JSON.stringify(result.content);
+      await turn.emit({ type: "assistant", payload: { text: reply }, scopeLabel: turn.scopeLabel });
+      return { reply, modelCalls: 1 };
     },
-    {
-      async runTurn(turn) {
-        await turn.emit({ type: "user", payload: { text: turn.input }, scopeLabel: turn.scopeLabel });
-        const ref = {
-          current: turn.tools,
-          scopeLabel: turn.scopeLabel,
-          emit: turn.emit,
-          screenToolResult: turn.screenToolResult,
-          pendingApprovals: [],
-        };
-        const tool = createAgentTools(ref).find((tool) => tool.name === "subagents")!;
-        const execute = tool.execute as unknown as (id: string, input: unknown) => Promise<{ content: unknown[] }>;
-        const result = await execute(`wait-call-${++callSeq}`, { action: "wait", timeoutMs: 0 });
-        const reply = JSON.stringify(result.content);
-        await turn.emit({ type: "assistant", payload: { text: reply }, scopeLabel: turn.scopeLabel });
-        return { reply, modelCalls: 1 };
-      },
-      async screenSecurity() {
-        return { decision: "strict" as const, reason: "test quarantine" };
-      },
+    async screenSecurity() {
+      return { decision: "strict" as const, reason: "test quarantine" };
     },
-  );
+  };
   const acl = createAclStore();
   const auditLog = createAuditLog();
   const workspace = createLocalWorkspaceStore(mkdtempSync(join(tmpdir(), "session-mail-")));
@@ -115,7 +106,7 @@ async function scenario() {
     modelGateway: createModelGateway(),
     auditLog,
     rateLimiter: createRateLimiter({ maxPerWindow: 100, windowMs: 60_000 }),
-    harness,
+    agent,
     memory: createMemoryService(workspace),
     deploy: createDeployService({
       ...singleProcessDeps(),

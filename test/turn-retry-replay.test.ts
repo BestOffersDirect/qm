@@ -17,7 +17,7 @@ import { createMemoryService } from "../src/memory/memory-service.ts";
 import { createModelGateway } from "../src/model/model-gateway.ts";
 import { createAuditLog } from "../src/audit/audit-log.ts";
 import { createRateLimiter } from "../src/ratelimit/rate-limiter.ts";
-import { defineHarness } from "../src/harness/harness.ts";
+import type { Agent } from "../src/agent/agent.ts";
 import { createDeployStore } from "../src/deploy/deploy-store.ts";
 import { createDockerDeployProvider } from "../src/deploy/docker-deploy-provider.ts";
 import { createDeployService } from "../src/deploy/deploy-service.ts";
@@ -56,51 +56,42 @@ function buildScenario(interruptAfterToolResult = false) {
   const continued: Array<boolean | undefined> = [];
   const environments: Array<string | undefined> = [];
   const sandbox = fakeSandbox();
-  const harness = defineHarness(
-    {
-      id: "pi",
-      controlTransport: "in-process",
-      toolTransport: "in-process",
-      transcriptFormat: "pi",
-      capabilities: new Set(),
-    },
-    {
-      async runTurn(turn) {
-        turns.push(turn.input);
-        continued.push(turn.continueTurn);
-        environments.push(turn.environment);
-        if (!turn.continueTurn)
-          await turn.emit({
-            type: "user",
-            payload: { text: turn.input },
-            scopeLabel: turn.scopeLabel,
-          });
-        if (interruptAfterToolResult && turns.length === 1) {
-          await turn.emit({
-            type: "tool_call",
-            payload: { tool: "execute", callId: "c1", command: "ls" },
-            scopeLabel: turn.scopeLabel,
-          });
-          await turn.emit({
-            type: "tool_result",
-            payload: { tool: "execute", callId: "c1", result: "a.txt" },
-            scopeLabel: turn.scopeLabel,
-          });
-          throw new Error("interrupted after recording a tool result");
-        }
-        const reply = "it runs on this conversation's computer";
+  const agent: Agent = {
+    async runTurn(turn) {
+      turns.push(turn.input);
+      continued.push(turn.continueTurn);
+      environments.push(turn.environment);
+      if (!turn.continueTurn)
         await turn.emit({
-          type: "assistant",
-          payload: { text: reply },
+          type: "user",
+          payload: { text: turn.input },
           scopeLabel: turn.scopeLabel,
         });
-        return { reply, modelCalls: 1 };
-      },
-      async screenSecurity() {
-        return { decision: "auto" as const };
-      },
+      if (interruptAfterToolResult && turns.length === 1) {
+        await turn.emit({
+          type: "tool_call",
+          payload: { tool: "execute", callId: "c1", command: "ls" },
+          scopeLabel: turn.scopeLabel,
+        });
+        await turn.emit({
+          type: "tool_result",
+          payload: { tool: "execute", callId: "c1", result: "a.txt" },
+          scopeLabel: turn.scopeLabel,
+        });
+        throw new Error("interrupted after recording a tool result");
+      }
+      const reply = "it runs on this conversation's computer";
+      await turn.emit({
+        type: "assistant",
+        payload: { text: reply },
+        scopeLabel: turn.scopeLabel,
+      });
+      return { reply, modelCalls: 1 };
     },
-  );
+    async screenSecurity() {
+      return { decision: "auto" as const };
+    },
+  };
   const sessions = createMemorySessionStore();
   const { runs } = createMemoryRunStore();
   const acl = createAclStore();
@@ -118,7 +109,7 @@ function buildScenario(interruptAfterToolResult = false) {
     modelGateway: createModelGateway(),
     auditLog,
     rateLimiter: createRateLimiter({ maxPerWindow: 100, windowMs: 60_000 }),
-    harness,
+    agent,
     memory: createMemoryService(workspace),
     deploy: createDeployService({
       ...singleProcessDeps(),
@@ -286,7 +277,7 @@ test("a turn that recorded no reply replays as silent, not as an empty answer", 
   assert.equal(turns.length, 0);
 });
 
-test("a resume whose recorded work ends at a tool result asks the harness to continue the assistant turn", async () => {
+test("a resume whose recorded work ends at a tool result asks the agent to continue the assistant turn", async () => {
   const { orchestrator, runs, turns, continued, environments, input, asks } = buildScenario(true);
   const run = (await runs.enqueue({ sessionId: conversation.threadRef, request: input(ASK) })).run;
   await assert.rejects(
@@ -298,7 +289,7 @@ test("a resume whose recorded work ends at a tool result asks the harness to con
   assert.equal(retry.status, "ok");
   assert.deepEqual(continued, [undefined, true], "unchanged inventories preserve assistant continuation");
   assert.doesNotMatch(environments[1]!, /## Where you are|Environment changes/);
-  assert.equal(turns[1], ASK, "only the original request travels, as the harness's fallback");
+  assert.equal(turns[1], ASK, "only the original request travels, as the agent's fallback");
   assert.equal((await asks()).length, 1);
 });
 
@@ -314,7 +305,7 @@ test("a resume whose last tool call has no recorded result settles it and contin
   const retry = await orchestrator.handleTurn(input(ASK, { runId: run.id, attempt: 2 }));
   assert.equal(retry.status, "ok");
   assert.deepEqual(continued, [true]);
-  assert.equal(turns[0], ASK, "only the original request travels, as the harness's fallback");
+  assert.equal(turns[0], ASK, "only the original request travels, as the agent's fallback");
   const settled = (await sessions.getEntries((await sessions.getByThread(conversation.threadRef))!.id)).find(
     (e) => e.type === "tool_result",
   );

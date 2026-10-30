@@ -15,7 +15,7 @@ import { canonicalJson } from "../../cli/src/canonical-json.ts";
 import { resolveSwarmSettings, type SwarmSettings } from "./swarm-settings.ts";
 import { inheritRuntime, spawnRuntime, type SpawnRuntimeFields, type SwarmTemplate } from "./swarm-runtime.ts";
 import { errMessage, swallow, swallowAs } from "../util/errors.ts";
-import { goalFromParams, GoalCreateParams, type GoalCreateInput } from "../harness/goal.ts";
+import { goalFromParams, GoalCreateParams, type GoalCreateInput } from "../agent/goal.ts";
 import { Check } from "typebox/value";
 import {
   assertSwarmOpen,
@@ -184,7 +184,6 @@ function dispatchContract(input: OrchestratorInput) {
     unattendedGrants: input.unattendedGrants,
     readOnly: input.readOnly,
     skipMemory: input.skipMemory,
-    harness: input.harness,
     model: input.model,
     thinkingLevel: input.thinkingLevel,
     fastMode: input.fastMode,

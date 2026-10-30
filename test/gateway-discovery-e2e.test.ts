@@ -6,7 +6,7 @@ import { test } from "node:test";
 import { createGatewayCatalog } from "../src/model/gateway-catalog.ts";
 import { setGatewayModels } from "../src/model/gateway-models.ts";
 import { resolveModel } from "../src/model/pi-models.ts";
-import { oneShot } from "../src/harness/pi-harness.ts";
+import { oneShot } from "../src/agent/agent-run.ts";
 import { buildApp } from "../src/wiring.ts";
 import { testConfig } from "./support/test-config.ts";
 import { runtimeConfigBody } from "../src/api/runtime-config.ts";
@@ -222,7 +222,6 @@ for (const protocol of ["openai", "anthropic", "unknown"] as const)
     const built = buildApp(
       testConfig({
         modelGateway: config,
-        harness: "pi",
         modelId: "gateway/acme/future",
       }),
     );
@@ -231,7 +230,6 @@ for (const protocol of ["openai", "anthropic", "unknown"] as const)
       {
         deps: {
           config: built.config,
-          harnessId: "pi",
           baseModelDefault: "gateway/acme/future",
           modelCredentials: built.modelCredentials,
           refreshModels: built.refreshModels,
@@ -239,7 +237,7 @@ for (const protocol of ["openai", "anthropic", "unknown"] as const)
       },
       scopeId("org", "default-org"),
     );
-    assert.deepEqual(runtime.modelsByHarness.pi, ["gateway/acme/future"]);
+    assert.deepEqual(runtime.models, ["gateway/acme/future"]);
     assert.equal(runtime.modelCatalog["gateway/acme/future"]?.api, expectedApi);
     assert.doesNotMatch(JSON.stringify(runtime), /company-key|127\.0\.0\.1/);
     const catalog = createGatewayCatalog(config, fetch, () => Date.now() + clockOffset);

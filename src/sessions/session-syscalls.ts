@@ -1,6 +1,6 @@
 import { commonEntrySeqs } from "./transcript-source.ts";
 import { isSessionTurn, sessionTurnOrigin } from "../core/turn-origin.ts";
-import { TURN_STOPPED_KIND } from "../harness/replay.ts";
+import { TURN_STOPPED_KIND } from "../agent/replay.ts";
 import { principalDestination } from "../reach/reach.ts";
 import type { DeliveryStore } from "../delivery/delivery-store.ts";
 import { deliveryCandidatesFor } from "../core/orchestrator/turn-helpers.ts";
@@ -121,7 +121,6 @@ interface SessionOpenInput {
   name?: string;
   readOnly?: boolean;
   model?: string;
-  harness?: string;
   thinkingLevel?: string;
   fastMode?: boolean;
 }
@@ -369,7 +368,6 @@ function childRunRequest(child: Session, meta: SpawnMeta, text: string, displayT
     envelopeWrapped: true,
     ...(meta.readOnly ? { readOnly: true } : {}),
     ...(meta.model ? { model: meta.model } : {}),
-    ...(meta.harness ? { harness: meta.harness } : {}),
     ...(meta.thinkingLevel ? { thinkingLevel: meta.thinkingLevel } : {}),
     ...(meta.fastMode !== undefined ? { fastMode: meta.fastMode } : {}),
     ...(meta.timezone ? { timezone: meta.timezone } : {}),
@@ -702,7 +700,6 @@ export function createSessionSyscalls(deps: SessionSyscallDeps): SessionSyscalls
                 ...(binding.request.timezone ? { timezone: binding.request.timezone } : {}),
                 ...(input.readOnly || binding.request.readOnly ? { readOnly: true } : {}),
                 ...(input.model ? { model: input.model } : {}),
-                ...(input.harness ? { harness: input.harness } : {}),
                 ...(input.thinkingLevel ? { thinkingLevel: input.thinkingLevel } : {}),
                 ...(input.fastMode !== undefined ? { fastMode: input.fastMode } : {}),
               };
@@ -776,7 +773,6 @@ export function createSessionSyscalls(deps: SessionSyscallDeps): SessionSyscalls
                   ...(target.parentSessionId
                     ? {
                         model: target.spawnMeta?.model,
-                        harness: target.spawnMeta?.harness,
                         thinkingLevel: target.spawnMeta?.thinkingLevel,
                         fastMode: target.spawnMeta?.fastMode,
                       }

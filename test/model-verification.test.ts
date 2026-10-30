@@ -161,7 +161,7 @@ import { buildApp, serverDeps } from "../src/wiring.ts";
 import { testConfig } from "./support/test-config.ts";
 import { createInsecureTestServer } from "../src/api/server.ts";
 import type { AddressInfo } from "node:net";
-import { probeModel } from "../src/harness/pi-harness.ts";
+import { probeModel } from "../src/agent/agent-run.ts";
 import { modelFromOverlay } from "../src/model/pi-models.ts";
 import { parseModelOverlay } from "../src/model/model-overlay.ts";
 import { setProviderBaseUrls } from "../src/model/provider-endpoints.ts";
@@ -170,7 +170,6 @@ test("live API verifies exact serving credentials, blocks denied models, recheck
   const upstream = await verificationUpstream();
   const config = testConfig({
     openaiApiKey: "verification-test-key",
-    harness: "pi",
     providerBaseUrls: { openai: upstream.url + "/v1", anthropic: upstream.url },
   });
   const built = buildApp(config, { modelCredentialFetch: async () => Response.json({ data: [] }) });
@@ -238,7 +237,6 @@ test("live API verifies exact serving credentials, blocks denied models, recheck
     assert.equal((await put({ ...spec, name: "Verified edit", verify: true })).status, 200);
     assert.equal(upstream.requests.length, beforeEdit + 1);
     await built.config.setRuntimeSelection("personal:admin-alice@default-org", {
-      harnessId: "pi",
       modelId: spec.id,
     });
     await built.modelCredentials.set("openai", "rotated-test-key", "admin-alice");
