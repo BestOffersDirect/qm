@@ -71,7 +71,7 @@ export type FetchLike = (
   json(): Promise<unknown>;
 }>;
 
-const realFetch: FetchLike = publicFetch;
+const realFetch: FetchLike = (url, init) => publicFetch(url, { ...init, signal: AbortSignal.timeout(15_000) });
 
 function parseScopes(raw: unknown): string[] | undefined {
   if (Array.isArray(raw)) return raw.map(String);
@@ -709,7 +709,7 @@ export async function exchangeCode(
 
 function providerForHost(host: string): { name: string; config: OAuthProviderConfig } | null {
   for (const [name, config] of [...Object.entries(PROVIDERS), ...publicProviders]) {
-    if (config.hosts.some((h) => host === h || host.endsWith(`.${h}`))) return { name, config };
+    if (config.hosts.includes(host)) return { name, config };
   }
   return null;
 }
