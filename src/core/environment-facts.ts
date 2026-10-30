@@ -4,13 +4,22 @@ import type { SessionEntry } from "../types.ts";
 export const memberLabel = (m: { principalId: string; displayName: string; slackId?: string }): string =>
   `${m.displayName} (${[m.principalId, m.slackId].filter(Boolean).join(", ")})`;
 
-export function renderSandboxProviders(names: readonly string[], defaultName?: string, listable = true): string {
+export function renderSandboxProviders(
+  names: readonly string[],
+  defaultName?: string,
+  listable = true,
+  proxied: readonly string[] = [],
+): string {
   if (!names.length) return "";
   const listed = [
     ...names.filter((name) => name === defaultName).map((name) => `${name} (default)`),
     ...names.filter((name) => name !== defaultName).toSorted(),
   ];
-  return `## Sandboxes\n${listed.join(", ")}.${listable ? " `sandbox list` for details." : ""}`;
+  const behindProxy = names.filter((name) => proxied.includes(name)).toSorted();
+  const network = behindProxy.length
+    ? `\nComputers on ${behindProxy.join(", ")} reach the network only through the egress proxy in $HTTPS_PROXY. If it is https://, Python's urllib and http.client fail there (BadStatusLine, RemoteDisconnected); use curl, git, Python requests, or Node with NODE_USE_ENV_PROXY=1.`
+    : "";
+  return `## Sandboxes\n${listed.join(", ")}.${listable ? " `sandbox list` for details." : ""}${network}`;
 }
 
 interface RosterSnapshot {
